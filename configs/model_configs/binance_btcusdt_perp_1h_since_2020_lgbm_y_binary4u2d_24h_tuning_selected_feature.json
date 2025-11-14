@@ -1,0 +1,141 @@
+{
+  "feature_store": {
+    "features_csv": "/Volumes/Extreme SSD/trading_data/cex/training/binance_btcusdt_perp_1h_original/feature_store/features.csv",
+    "targets_csv": "/Volumes/Extreme SSD/trading_data/cex/training/binance_btcusdt_perp_1h_original/feature_store/targets_24h.csv"
+  },
+  "feature_selection": {
+    "include_files": [
+    "configs/feature_lists/binance_btcusdt_p60_selected_trial1.json"
+  ]
+  },
+  "output_dir": "/Volumes/Extreme SSD/trading_data/cex/models/binance_btcusdt_perp_1h_original",
+  "training_splits_dir": "/Volumes/Extreme SSD/trading_data/cex/training/binance_btcusdt_perp_1h_original",
+  "target": {
+    "variable": "y_tp_before_sl_u0.04_d0.02_24h",
+    "objective": "binary"
+  },
+  "split": {
+    "train_ratio": 0.81,
+    "val_ratio": 0.006,
+    "test_ratio": 0.18,
+    "warmup_rows": 744
+  },
+  "model": {
+    "type": "lgbm",
+    "hyperparameter_tuning_method": "bayesian",
+    "hyperparameter_search_space": {
+      "learning_rate": [
+        0.01,
+        0.02,
+        0.03,
+        0.05,
+        0.07,
+        0.005
+      ],
+      "num_leaves": [
+        15,
+        20,
+        31,
+        63,
+        127,
+        255,
+        300,
+        400
+      ],
+      "max_depth": [
+        -1,
+        6,
+        8,
+        10,
+        12
+      ],
+      "min_data_in_leaf": [
+        25,
+        50,
+        100,
+        200
+      ],
+      "feature_fraction": [
+        0.6,
+        0.75,
+        0.9,
+        1.0
+      ],
+      "bagging_fraction": [
+        0.6,
+        0.75,
+        0.9,
+        1.0
+      ],
+      "bagging_freq": [
+        0,
+        1,
+        2,
+        5
+      ],
+      "lambda_l1": [
+        0.0,
+        0.1,
+        0.5,
+        1.0,
+        2.0
+      ],
+      "lambda_l2": [
+        0.0,
+        0.1,
+        1.0,
+        2.0,
+        5.0
+      ],
+      "max_bin": [
+        127,
+        255,
+        511,
+        1023
+      ],
+      "min_split_gain": [
+        0.0,
+        0.1,
+        0.2,
+        0.3
+      ],
+      "min_sum_hessian_in_leaf": [
+        0.001,
+        0.01,
+        0.05,
+        0.1
+      ]
+    },
+    "cv": {
+      "method": "expanding",
+      "n_folds": 5,
+      "fold_val_size": 0.15,
+      "gap": 48,
+      "num_boost_round": 6000,
+      "early_stopping_rounds": 400,
+      "log_period": 50,
+      "min_best_iteration": 5
+    },
+    "use_best_params_for_final": true,
+    "params": {
+      "learning_rate": 0.05,
+      "num_leaves": 63,
+      "max_depth": 6,
+      "min_data_in_leaf": 100,
+      "feature_fraction": 0.8,
+      "bagging_fraction": 0.8,
+      "bagging_freq": 1,
+      "boosting": "gbdt",
+      "lambda_l1": 0.1,
+      "lambda_l2": 5.0,
+      "max_bin": 255,
+      "min_split_gain": 0.1,
+      "num_boost_round": 6000,
+      "early_stopping_rounds": 1000,
+      "seed": 42
+    },
+    "eval_metrics": [
+      "auc"
+    ]
+  }
+}
