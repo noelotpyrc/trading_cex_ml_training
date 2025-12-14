@@ -101,7 +101,7 @@ def register_with_mlflow(
     sanitize_paths: bool = False,
 ) -> None:
     repo_root = Path(__file__).resolve().parent.parent
-    registrar = repo_root / "mlflow" / "mlflow_register.py"
+    registrar = repo_root / "mlflow_scripts" / "mlflow_register.py"
     cmd = [
         sys.executable,
         str(registrar),
@@ -175,7 +175,7 @@ def main() -> None:
         else:
             # Log run only, no model registry
             repo_root = Path(__file__).resolve().parent.parent
-            registrar = repo_root / "mlflow" / "mlflow_register.py"
+            registrar = repo_root / "mlflow_scripts" / "mlflow_register.py"
             import subprocess, sys
             cmd = [
                 sys.executable, str(registrar),
