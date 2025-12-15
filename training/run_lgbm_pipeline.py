@@ -19,6 +19,7 @@ import csv
 import logging
 import sys
 import fnmatch
+import uuid
 from datetime import datetime
 from itertools import product
 from pathlib import Path
@@ -231,7 +232,8 @@ def prepare_training_data(config: Dict[str, Any]) -> Path:
             raise FileNotFoundError(f"Existing splits missing required files: {missing} under {existing_dir}")
         prepared_dir = existing_dir
     else:
-        ts = config.get('_run_ts') or datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Use UUID suffix for uniqueness (prevents race conditions in parallel runs)
+        ts = config.get('_run_ts') or f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         base_prepared_out = splits_root / f"prepared_{ts}"
         features_path = config.get('feature_store', {}).get('features_csv')
         targets_path = config.get('feature_store', {}).get('targets_csv')

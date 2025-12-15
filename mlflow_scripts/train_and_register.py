@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end wrapper: Train a model (LGBM or HMM) from a config and register it to MLflow.
+End-to-end wrapper: Train a model (LGBM, CatBoost, or HMM) from a config and register it to MLflow.
 
 Usage (LGBM example):
   /Users/noel/projects/trading_cex/venv/bin/python scripts/train_and_register.py \
@@ -39,6 +39,8 @@ def _detect_pipeline(config: Dict[str, Any]) -> str:
     model_type = str(model_cfg.get("type") or "").lower()
     if model_type == "lgbm":
         return "lgbm"
+    if model_type == "catboost":
+        return "catboost"
     # HMM heuristic: common keys
     if any(k in model_cfg for k in ("n_states", "covariance_type", "n_iter")):
         return "hmm"
@@ -70,6 +72,30 @@ def train_lgbm_from_config(config_path: Path) -> Path:
     run_dir = lgbm.persist_results(config, run_dir, metrics, final_params, data_dir)
     return run_dir
 
+
+
+
+def train_catboost_from_config(config_path: Path) -> Path:
+    # Ensure project root is on sys.path for package imports
+    _project_root = Path(__file__).resolve().parent.parent
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
+    from training import run_catboost_pipeline as catboost
+
+    config = catboost.load_config(config_path)
+    # Record the original config file path so the registrar can log it as a param
+    try:
+        config["_config_path"] = str(Path(config_path).resolve())
+    except Exception:
+        config["_config_path"] = str(config_path)
+    data_dir = catboost.prepare_training_data(config)
+    tuned_best_params = catboost.tune_hyperparameters(config, data_dir)
+    config["_tuned_best_params"] = tuned_best_params
+    use_best_for_final = bool(config["model"].get("use_best_params_for_final", True))
+    final_params = tuned_best_params if use_best_for_final else config["model"].get("params", {})
+    _, metrics, run_dir = catboost.train_model(config, data_dir, final_params)
+    run_dir = catboost.persist_results(config, run_dir, metrics, final_params, data_dir)
+    return run_dir
 
 def train_hmm_from_config(config_path: Path, log_level: str = "INFO") -> Path:
     # Ensure project root is on sys.path for package imports
@@ -131,7 +157,7 @@ def register_with_mlflow(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Train model from config and register to MLflow")
     ap.add_argument("--config", type=Path, required=True)
-    ap.add_argument("--pipeline", choices=["auto", "lgbm", "hmm"], default="auto")
+    ap.add_argument("--pipeline", choices=["auto", "lgbm", "catboost", "hmm"], default="auto")
     ap.add_argument("--tracking-uri", required=True)
     ap.add_argument("--experiment", required=True)
     ap.add_argument("--model-name", default=None)
@@ -150,6 +176,8 @@ def main() -> None:
 
     if pipeline == "lgbm":
         run_dir = train_lgbm_from_config(args.config)
+    elif pipeline == "catboost":
+        run_dir = train_catboost_from_config(args.config)
     elif pipeline == "hmm":
         run_dir = train_hmm_from_config(args.config, args.log_level)
     else:
