@@ -26,7 +26,7 @@ import plotly.graph_objects as go
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────────
 
-TRACKING_URI = "http://127.0.0.1:5000"
+TRACKING_URI = "http://127.0.0.1:5001"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data Loading Functions
@@ -281,7 +281,7 @@ def plot_param_vs_auc(merged_df: pd.DataFrame, param: str):
         x1=max_val, y1=max_val,
         line=dict(color="gray", dash="dash"),
     )
-    
+
     fig.update_layout(
         height=300,
         margin=dict(t=40, b=40),
@@ -290,11 +290,51 @@ def plot_param_vs_auc(merged_df: pd.DataFrame, param: str):
     return fig
 
 
+def plot_param_generalization_gap(merged_df: pd.DataFrame, param: str):
+    """Plot boxplot of generalization gap (AUC test - AUC train) grouped by param value."""
+    # Check for train AUC - could be auc_train or auc_val
+    train_col = None
+    for col in ["auc_train", "auc_val"]:
+        if col in merged_df.columns:
+            train_col = col
+            break
+    
+    if train_col is None or param not in merged_df.columns or "auc_test" not in merged_df.columns:
+        return None
+    
+    df = merged_df[[param, train_col, "auc_test"]].dropna().copy()
+    if df.empty:
+        return None
+    
+    # Calculate generalization gap (negative = overfitting)
+    df["gap"] = df["auc_test"] - df[train_col]
+    df["param_str"] = df[param].astype(str)
+    
+    fig = px.box(
+        df,
+        x="param_str",
+        y="gap",
+        title=f"Generalization Gap by {param}",
+        labels={"param_str": param, "gap": "AUC Test - AUC Train"},
+        points="all",
+    )
+    
+    # Add zero line (no gap = perfect generalization)
+    fig.add_hline(y=0, line_dash="dash", line_color="red", 
+                  annotation_text="No Gap")
+    
+    fig.update_layout(
+        height=300,
+        margin=dict(t=40, b=40),
+    )
+    return fig
+
+
 def plot_metrics_over_runs(metrics_df: pd.DataFrame, metric: str):
     """Plot metric values across runs."""
     if metric not in metrics_df.columns:
         return None
-    
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=list(range(1, len(metrics_df) + 1)),
@@ -338,6 +378,11 @@ def main():
     
     with st.sidebar:
         st.header("⚙️ Configuration")
+        
+        # Refresh button to clear cache and reload experiments
+        if st.button("🔄 Refresh Experiments"):
+            st.cache_data.clear()
+            st.rerun()
         
         try:
             experiments = get_all_experiments()
@@ -465,36 +510,117 @@ def main():
                         )
     
     # ─────────────────────────────────────────────────────────────────────────
-    # Tab 2: Feature Importance
+    # Tab 2: Feature Importance Comparison
     # ─────────────────────────────────────────────────────────────────────────
     
     with tab2:
-        st.header("🎯 Feature Importance")
+        st.header("🎯 Feature Importance Comparison")
         
-        fi_df = aggregate_feature_importance(run_dirs)
+        # Dual experiment selector
+        st.subheader("Select Two Experiments to Compare")
+        col_exp1, col_exp2 = st.columns(2)
         
-        if fi_df is None or fi_df.empty:
-            st.warning("No feature importance data found.")
+        with col_exp1:
+            exp1_name = st.selectbox(
+                "Experiment A",
+                options=exp_names,
+                index=0,
+                key="fi_exp1"
+            )
+        
+        with col_exp2:
+            # Default to second experiment if available
+            default_idx = 1 if len(exp_names) > 1 else 0
+            exp2_name = st.selectbox(
+                "Experiment B",
+                options=exp_names,
+                index=default_idx,
+                key="fi_exp2"
+            )
+        
+        # Get run dirs for both experiments
+        def get_exp_run_dirs(exp_name):
+            exp = next((e for e in experiments if e["name"] == exp_name), None)
+            if exp is None:
+                return []
+            exp_runs = get_runs_for_experiment(exp["experiment_id"])
+            dirs = []
+            for _, row in exp_runs.iterrows():
+                rd = row.get("params.run_dir")
+                if rd and Path(rd).exists():
+                    dirs.append(rd)
+            return dirs
+        
+        run_dirs_1 = get_exp_run_dirs(exp1_name)
+        run_dirs_2 = get_exp_run_dirs(exp2_name)
+        
+        st.info(f"**{exp1_name}**: {len(run_dirs_1)} runs | **{exp2_name}**: {len(run_dirs_2)} runs")
+        
+        fi_df1 = aggregate_feature_importance(run_dirs_1)
+        fi_df2 = aggregate_feature_importance(run_dirs_2)
+        
+        if fi_df1 is None or fi_df1.empty:
+            st.warning(f"No feature importance data for {exp1_name}.")
+        elif fi_df2 is None or fi_df2.empty:
+            st.warning(f"No feature importance data for {exp2_name}.")
         else:
-            col1, col2 = st.columns([2, 1])
+            # Calculate normalized importance (% of total)
+            fi_df1["Importance_Pct_A"] = fi_df1["Mean"] / fi_df1["Mean"].sum() * 100
+            fi_df2["Importance_Pct_B"] = fi_df2["Mean"] / fi_df2["Mean"].sum() * 100
+            
+            # Side by side charts  
+            top_n = st.slider("Top N Features", min_value=5, max_value=max(len(fi_df1), len(fi_df2)), value=15, key="fi_topn")
+            
+            col1, col2 = st.columns(2)
             
             with col1:
-                top_n = st.slider("Top N Features", min_value=5, max_value=len(fi_df), value=min(15, len(fi_df)))
-                fig = plot_feature_importance(fi_df, top_n=top_n)
-                st.plotly_chart(fig, use_container_width=True)
+                st.subheader(f"A: {exp1_name}")
+                st.caption(f"{len(fi_df1)} features")
+                fig1 = plot_feature_importance(fi_df1, top_n=top_n)
+                st.plotly_chart(fig1, use_container_width=True)
             
             with col2:
-                st.subheader("Full Ranking")
+                st.subheader(f"B: {exp2_name}")
+                st.caption(f"{len(fi_df2)} features")
+                fig2 = plot_feature_importance(fi_df2, top_n=top_n)
+                st.plotly_chart(fig2, use_container_width=True)
+            
+            # Common features comparison
+            st.subheader("Common Features Comparison")
+            
+            common_features = set(fi_df1["Feature"]) & set(fi_df2["Feature"])
+            st.info(f"**{len(common_features)}** features in common (A has {len(fi_df1) - len(common_features)} unique, B has {len(fi_df2) - len(common_features)} unique)")
+            
+            if common_features:
+                # Merge on common features only
+                merged = fi_df1[["Feature", "Mean", "Importance_Pct_A"]].merge(
+                    fi_df2[["Feature", "Mean", "Importance_Pct_B"]],
+                    on="Feature",
+                    how="inner",
+                    suffixes=("_A", "_B")
+                )
+                merged["Pct_Diff"] = merged["Importance_Pct_A"] - merged["Importance_Pct_B"]
+                merged = merged.sort_values("Mean_A", ascending=False).reset_index(drop=True)
+                
+                # Rename for display
+                display_df = merged[["Feature", "Mean_A", "Importance_Pct_A", "Mean_B", "Importance_Pct_B", "Pct_Diff"]].copy()
+                display_df.columns = ["Feature", "Mean A", "% A", "Mean B", "% B", "% Diff"]
+                
+                st.caption("% = Normalized importance within experiment | % Diff = A% - B% (positive = more important in A)")
+                
                 st.dataframe(
-                    fi_df.style.format({
-                        "Mean": "{:.2f}",
-                        "Std": "{:.2f}",
-                        "Min": "{:.2f}",
-                        "Max": "{:.2f}",
+                    display_df.style.format({
+                        "Mean A": "{:.2f}",
+                        "Mean B": "{:.2f}",
+                        "% A": "{:.1f}%",
+                        "% B": "{:.1f}%",
+                        "% Diff": "{:+.1f}%",
                     }),
                     use_container_width=True,
                     height=500,
                 )
+            else:
+                st.warning("No common features between the two experiments.")
     
     # ─────────────────────────────────────────────────────────────────────────
     # Tab 3: Best Params Analysis
@@ -503,49 +629,81 @@ def main():
     with tab3:
         st.header("⚙️ Best Params Analysis")
         
-        params_df = aggregate_best_params(run_dirs)
+        # Multi-experiment selector
+        st.subheader("Select Experiments")
+        selected_experiments = st.multiselect(
+            "Choose experiments to analyze (runs will be combined)",
+            options=exp_names,
+            default=[selected_exp_name],
+            help="Select multiple experiments to combine their runs for parameter analysis"
+        )
         
-        if params_df is None or params_df.empty:
-            st.warning("No best params data found in run directories.")
+        if not selected_experiments:
+            st.warning("Please select at least one experiment.")
         else:
-            # Filter out non-tunable params
-            excluded_params = {"od_wait", "random_seed", "run_dir"}
-            param_cols = [c for c in params_df.columns if c not in excluded_params]
+            # Collect run_dirs from all selected experiments
+            all_run_dirs = []
+            for exp_name in selected_experiments:
+                exp = next((e for e in experiments if e["name"] == exp_name), None)
+                if exp:
+                    exp_runs_df = get_runs_for_experiment(exp["experiment_id"])
+                    for _, row in exp_runs_df.iterrows():
+                        rd = row.get("params.run_dir")
+                        if rd and Path(rd).exists():
+                            all_run_dirs.append(rd)
             
-            # Summary table
-            st.subheader("Parameter Summary")
-            summary_df = get_param_summary(params_df)
-            st.dataframe(summary_df, use_container_width=True)
+            st.info(f"📊 Analyzing **{len(all_run_dirs)}** runs from **{len(selected_experiments)}** experiment(s)")
             
-            # Merge params with metrics for scatter plots
-            metrics_df = aggregate_metrics(run_dirs)
-            if metrics_df is not None:
-                # Join on run_dir
-                merged_df = params_df.merge(metrics_df, on="run_dir", how="left")
+            params_df = aggregate_best_params(all_run_dirs)
+            
+            if params_df is None or params_df.empty:
+                st.warning("No best params data found in run directories.")
             else:
-                merged_df = params_df.copy()
-            
-            # Parameter analysis (one per row with histogram + scatter)
-            st.subheader("Parameter Analysis")
-            
-            for param in param_cols:
-                st.markdown(f"### `{param}`")
-                col1, col2 = st.columns(2)
+                # Filter out non-tunable params
+                excluded_params = {"od_wait", "random_seed", "run_dir"}
+                param_cols = [c for c in params_df.columns if c not in excluded_params]
                 
-                with col1:
-                    fig = plot_param_histogram(params_df, param)
-                    st.plotly_chart(fig, use_container_width=True)
+                # Summary table
+                st.subheader("Parameter Summary")
+                summary_df = get_param_summary(params_df)
+                st.dataframe(summary_df, use_container_width=True)
                 
-                with col2:
-                    fig = plot_param_vs_auc(merged_df, param)
-                    if fig:
+                # Merge params with metrics for scatter plots
+                metrics_df = aggregate_metrics(all_run_dirs)
+                if metrics_df is not None:
+                    # Join on run_dir
+                    merged_df = params_df.merge(metrics_df, on="run_dir", how="left")
+                else:
+                    merged_df = params_df.copy()
+                
+                # Parameter analysis (one per row with histogram + scatter)
+                st.subheader("Parameter Analysis")
+                
+                for param in param_cols:
+                    st.markdown(f"### `{param}`")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        fig = plot_param_histogram(params_df, param)
                         st.plotly_chart(fig, use_container_width=True)
-                    else:
-                        st.info("No AUC data available")
-            
-            # Raw data expander
-            with st.expander("View Raw Parameters Table"):
-                st.dataframe(params_df.drop(columns=["run_dir"]), use_container_width=True)
+                    
+                    with col2:
+                        fig = plot_param_vs_auc(merged_df, param)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No AUC data available")
+                    
+                    with col3:
+                        fig = plot_param_generalization_gap(merged_df, param)
+                        if fig:
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.info("No gap data available")
+                
+                # Raw data expander
+                with st.expander("View Raw Parameters Table"):
+                    st.dataframe(params_df.drop(columns=["run_dir"]), use_container_width=True)
     
     # ─────────────────────────────────────────────────────────────────────────
     # Tab 4: Stability Analysis
