@@ -357,6 +357,47 @@ def plot_metrics_over_runs(metrics_df: pd.DataFrame, metric: str):
     return fig
 
 
+def render_aggregated_feature_importance(
+    run_dirs: List[str],
+    top_n_key: str,
+    title: str = "Aggregated Feature Importance",
+):
+    """Render aggregated feature importance section."""
+    st.subheader(title)
+    fi_df = aggregate_feature_importance(run_dirs)
+
+    if fi_df is None or fi_df.empty:
+        st.warning("No feature importance data found in run directories.")
+        return
+
+    max_top_n = max(1, len(fi_df))
+    default_top_n = min(15, len(fi_df))
+    top_n = st.slider(
+        "Top N Features",
+        min_value=1,
+        max_value=max_top_n,
+        value=default_top_n,
+        key=top_n_key,
+    )
+
+    fig = plot_feature_importance(fi_df, top_n=top_n)
+    st.plotly_chart(fig, use_container_width=True, key=f"{top_n_key}_chart")
+    table_df = fi_df.head(top_n)
+    st.dataframe(
+        table_df.style.format(
+            {
+                "Mean": "{:.4f}",
+                "Std": "{:.4f}",
+                "Min": "{:.4f}",
+                "Max": "{:.4f}",
+                "Runs": "{:.0f}",
+            }
+        ),
+        use_container_width=True,
+        height=500,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Streamlit App
 # ─────────────────────────────────────────────────────────────────────────────
@@ -445,7 +486,7 @@ def main():
     
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "📈 Metrics Summary",
-        "🎯 Feature Importance",
+        "🆚 Compare Experiments",
         "⚙️ Best Params",
         "📉 Stability Analysis",
         "🔍 Run Details",
@@ -463,6 +504,12 @@ def main():
         if metrics_df is None or metrics_df.empty:
             st.warning("No metrics found in run directories.")
         else:
+            if "auc_train" in metrics_df.columns and "auc_test" in metrics_df.columns:
+                metrics_df = metrics_df.copy()
+                metrics_df["auc_train/auc_test"] = (
+                    metrics_df["auc_train"]
+                    / metrics_df["auc_test"].replace(0, np.nan)
+                )
             # Identify numeric metric columns
             metric_cols = [c for c in metrics_df.columns 
                           if c != "run_dir" and pd.api.types.is_numeric_dtype(metrics_df[c])]
@@ -508,13 +555,20 @@ def main():
                             f"{metrics_df['rmse_test'].mean():.4f}",
                             f"±{metrics_df['rmse_test'].std():.4f}"
                         )
+
+        st.divider()
+        render_aggregated_feature_importance(
+            run_dirs,
+            top_n_key="metrics_fi_topn",
+            title="Aggregated Feature Importance",
+        )
     
     # ─────────────────────────────────────────────────────────────────────────
-    # Tab 2: Feature Importance Comparison
+    # Tab 2: Compare Experiments
     # ─────────────────────────────────────────────────────────────────────────
     
     with tab2:
-        st.header("🎯 Feature Importance Comparison")
+        st.header("🆚 Compare Experiments")
         
         # Dual experiment selector
         st.subheader("Select Two Experiments to Compare")
@@ -556,6 +610,66 @@ def main():
         
         st.info(f"**{exp1_name}**: {len(run_dirs_1)} runs | **{exp2_name}**: {len(run_dirs_2)} runs")
         
+        # Metrics comparison
+        st.subheader("Metrics Comparison")
+        
+        metrics_df1 = aggregate_metrics(run_dirs_1)
+        metrics_df2 = aggregate_metrics(run_dirs_2)
+        
+        if metrics_df1 is None or metrics_df1.empty:
+            st.warning(f"No metrics found for {exp1_name}.")
+        elif metrics_df2 is None or metrics_df2.empty:
+            st.warning(f"No metrics found for {exp2_name}.")
+        else:
+            metrics_df1 = metrics_df1.copy()
+            metrics_df2 = metrics_df2.copy()
+            
+            train_col = None
+            if "auc_train" in metrics_df1.columns and "auc_train" in metrics_df2.columns:
+                train_col = "auc_train"
+            elif "auc_val" in metrics_df1.columns and "auc_val" in metrics_df2.columns:
+                train_col = "auc_val"
+            
+            ratio_col = None
+            if train_col and "auc_test" in metrics_df1.columns and "auc_test" in metrics_df2.columns:
+                ratio_col = "auc_train/auc_test" if train_col == "auc_train" else f"{train_col}/auc_test"
+                metrics_df1[ratio_col] = metrics_df1[train_col] / metrics_df1["auc_test"].replace(0, np.nan)
+                metrics_df2[ratio_col] = metrics_df2[train_col] / metrics_df2["auc_test"].replace(0, np.nan)
+            
+            metrics_cols = [c for c in [train_col, "auc_test", ratio_col] if c]
+            metrics_cols = [
+                c for c in metrics_cols
+                if c in metrics_df1.columns and c in metrics_df2.columns
+            ]
+            
+            if not metrics_cols:
+                st.warning("No comparable AUC metrics found across both experiments.")
+            else:
+                if train_col == "auc_val":
+                    st.caption("Using auc_val as train metric because auc_train is missing in one or both experiments.")
+                elif train_col is None:
+                    st.caption("auc_train not found in both experiments; showing auc_test only.")
+                
+                for metric in metrics_cols:
+                    st.markdown(f"#### `{metric}`")
+                    stats_a = metrics_df1[metric].agg(["mean", "std", "min", "max"]).rename(
+                        {"mean": "Mean", "std": "Std", "min": "Min", "max": "Max"}
+                    )
+                    stats_b = metrics_df2[metric].agg(["mean", "std", "min", "max"]).rename(
+                        {"mean": "Mean", "std": "Std", "min": "Min", "max": "Max"}
+                    )
+                    table = pd.DataFrame(
+                        [stats_a, stats_b],
+                        index=[exp1_name, exp2_name],
+                    )
+                    st.dataframe(
+                        table.style.format("{:.4f}"),
+                        use_container_width=True,
+                    )
+        
+        # Feature importance comparison
+        st.subheader("Feature Importance Comparison")
+        
         fi_df1 = aggregate_feature_importance(run_dirs_1)
         fi_df2 = aggregate_feature_importance(run_dirs_2)
         
@@ -568,8 +682,16 @@ def main():
             fi_df1["Importance_Pct_A"] = fi_df1["Mean"] / fi_df1["Mean"].sum() * 100
             fi_df2["Importance_Pct_B"] = fi_df2["Mean"] / fi_df2["Mean"].sum() * 100
             
-            # Side by side charts  
-            top_n = st.slider("Top N Features", min_value=5, max_value=max(len(fi_df1), len(fi_df2)), value=15, key="fi_topn")
+            # Side by side charts
+            max_top_n = max(1, max(len(fi_df1), len(fi_df2)))
+            default_top_n = min(15, max(len(fi_df1), len(fi_df2)))
+            top_n = st.slider(
+                "Top N Features",
+                min_value=1,
+                max_value=max_top_n,
+                value=default_top_n,
+                key="compare_fi_topn",
+            )
             
             col1, col2 = st.columns(2)
             
@@ -589,7 +711,11 @@ def main():
             st.subheader("Common Features Comparison")
             
             common_features = set(fi_df1["Feature"]) & set(fi_df2["Feature"])
-            st.info(f"**{len(common_features)}** features in common (A has {len(fi_df1) - len(common_features)} unique, B has {len(fi_df2) - len(common_features)} unique)")
+            st.info(
+                f"**{len(common_features)}** features in common (A has "
+                f"{len(fi_df1) - len(common_features)} unique, B has "
+                f"{len(fi_df2) - len(common_features)} unique)"
+            )
             
             if common_features:
                 # Merge on common features only

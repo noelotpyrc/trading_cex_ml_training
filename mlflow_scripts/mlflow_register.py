@@ -7,11 +7,11 @@ optionally registers/updates a model version and stage.
 
 Requires an MLflow tracking server (local is fine):
   mlflow server --backend-store-uri sqlite:////PATH/mlflow.db \
-    --default-artifact-root /PATH/mlflow_artifacts --host 127.0.0.1 --port 5000
+    --default-artifact-root /PATH/mlflow_artifacts --host 127.0.0.1 --port 5001
 
 Usage example:
   /Users/noel/projects/trading_cex/venv/bin/python scripts/mlflow_register.py \
-    --tracking-uri http://127.0.0.1:5000 \
+    --tracking-uri http://127.0.0.1:5001 \
     --experiment cex-btcusdt-p60 \
     --run-dir "/Volumes/Extreme SSD/trading_data/cex/models/BINANCE_BTCUSDT.P, 60/run_20251008_140235_lgbm_y_logret_168h_huber" \
     --model-name lgbm-btcusdt-p60 \
@@ -137,6 +137,27 @@ def main() -> None:
             # Store as comma-separated list for readability
             exclude = feature_selection.get("exclude")
             params["feature_selection.exclude"] = ",".join(exclude) if isinstance(exclude, list) else str(exclude)
+
+    combo_families = cfg.get("combo_families")
+    if combo_families:
+        params["combo_families"] = str(combo_families)
+    combo_family = cfg.get("combo_family")
+    if combo_family:
+        params["combo_family"] = str(combo_family)
+    combo_features = cfg.get("combo_features")
+    if combo_features:
+        if isinstance(combo_features, list):
+            params["combo_features"] = ",".join([str(x) for x in combo_features])
+        else:
+            params["combo_features"] = str(combo_features)
+    combo_size = cfg.get("combo_size")
+    if combo_size is None and isinstance(combo_features, list):
+        combo_size = len(combo_features)
+    if combo_size is not None:
+        try:
+            params["combo_size"] = int(combo_size)
+        except Exception:
+            params["combo_size"] = str(combo_size)
     
     # attach run_dir and model_path as params for auditability
     params["run_dir"] = str(run_dir)

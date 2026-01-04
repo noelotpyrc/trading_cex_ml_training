@@ -5,7 +5,7 @@ End-to-end wrapper: Train a model (LGBM, CatBoost, or HMM) from a config and reg
 Usage (LGBM example):
   /Users/noel/projects/trading_cex/venv/bin/python scripts/train_and_register.py \
     --config /Users/noel/projects/trading_cex/configs/model_configs/binance_btcusdt_p60_huber_y_logret_168h.json \
-    --tracking-uri http://127.0.0.1:5000 \
+    --tracking-uri http://127.0.0.1:5001 \
     --experiment cex-btcusdt-p60-lgbm \
     --model-name lgbm-btcusdt-p60 \
     --alias Staging
@@ -13,7 +13,7 @@ Usage (LGBM example):
 Usage (HMM example):
   /Users/noel/projects/trading_cex/venv/bin/python scripts/train_and_register.py \
     --config /Users/noel/projects/trading_cex/configs/model_configs/hmm_1d_all_features.json \
-    --tracking-uri http://127.0.0.1:5000 \
+    --tracking-uri http://127.0.0.1:5001 \
     --experiment test-hmm \
     --model-name hmm-btcusdt-p60 \
     --alias Staging
