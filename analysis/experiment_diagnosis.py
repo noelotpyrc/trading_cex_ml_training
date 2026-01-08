@@ -116,7 +116,11 @@ def aggregate_feature_importance(run_dirs: List[str]) -> Optional[pd.DataFrame]:
 
 
 def aggregate_metrics(run_dirs: List[str]) -> Optional[pd.DataFrame]:
-    """Aggregate metrics across multiple runs."""
+    """Aggregate metrics across multiple runs.
+    
+    Also loads pred_train.csv and pred_test.csv to compute mean prediction values
+    (pred_train, pred_test) for prediction stability analysis.
+    """
     all_metrics = []
     
     for run_dir in run_dirs:
@@ -127,6 +131,27 @@ def aggregate_metrics(run_dirs: List[str]) -> Optional[pd.DataFrame]:
                 with open(metrics_path, "r") as f:
                     metrics = json.load(f)
                 metrics["run_dir"] = run_dir
+                
+                # Load mean predictions from pred_train.csv and pred_test.csv
+                pred_train_path = run_path / "pred_train.csv"
+                pred_test_path = run_path / "pred_test.csv"
+                
+                if pred_train_path.exists():
+                    try:
+                        pred_train_df = pd.read_csv(pred_train_path)
+                        if "y_pred" in pred_train_df.columns:
+                            metrics["pred_train"] = pred_train_df["y_pred"].mean()
+                    except Exception:
+                        pass
+                
+                if pred_test_path.exists():
+                    try:
+                        pred_test_df = pd.read_csv(pred_test_path)
+                        if "y_pred" in pred_test_df.columns:
+                            metrics["pred_test"] = pred_test_df["y_pred"].mean()
+                    except Exception:
+                        pass
+                
                 all_metrics.append(metrics)
             except Exception:
                 pass
@@ -877,6 +902,103 @@ def main():
                                 st.success(f"✅ **STABLE**: Range ({value_range:.4f}) < {threshold}")
                             else:
                                 st.error(f"⚠️ **UNSTABLE**: Range ({value_range:.4f}) >= {threshold}")
+            
+            # ─────────────────────────────────────────────────────────────────
+            # Prediction Stability Charts (AUC train vs test, colored by pred metrics)
+            # ─────────────────────────────────────────────────────────────────
+            st.divider()
+            st.subheader("Prediction Stability Charts")
+            
+            # Determine train column
+            train_col = None
+            for col in ["auc_train", "auc_val"]:
+                if col in metrics_df.columns:
+                    train_col = col
+                    break
+            
+            # Check required columns
+            required_cols = ["auc_test", "pred_test", "pred_train"]
+            has_prediction_cols = train_col and all(c in metrics_df.columns for c in required_cols)
+            
+            if has_prediction_cols:
+                df = metrics_df[[train_col, "auc_test", "pred_test", "pred_train"]].dropna()
+                
+                if not df.empty:
+                    # Calculate derived metrics
+                    df = df.copy()
+                    df["pred_ratio"] = df["pred_test"] / df["pred_train"].replace(0, np.nan)
+                    df["pred_diff"] = (df["pred_test"] - df["pred_train"]).abs()
+                    
+                    # Diagonal range for reference line
+                    min_val = min(df[train_col].min(), df["auc_test"].min())
+                    max_val = max(df[train_col].max(), df["auc_test"].max())
+                    
+                    col1, col2 = st.columns(2)
+                    
+                    # Chart 1: Colored by pred_test/pred_train
+                    with col1:
+                        fig1 = px.scatter(
+                            df,
+                            x=train_col,
+                            y="auc_test",
+                            color="pred_ratio",
+                            color_continuous_scale="RdYlGn",
+                            title="AUC Train vs Test (Color: pred_test/pred_train)",
+                            labels={
+                                train_col: train_col.replace('_', ' ').title(),
+                                "auc_test": "AUC Test",
+                                "pred_ratio": "Pred Ratio",
+                            },
+                        )
+                        fig1.add_shape(
+                            type="line",
+                            x0=min_val, y0=min_val,
+                            x1=max_val, y1=max_val,
+                            line=dict(color="gray", dash="dash"),
+                        )
+                        fig1.update_layout(height=400)
+                        st.plotly_chart(fig1, use_container_width=True)
+                        
+                        # Stats for ratio
+                        ratio_mean = df["pred_ratio"].mean()
+                        ratio_std = df["pred_ratio"].std()
+                        st.caption(f"Pred Ratio: Mean={ratio_mean:.3f}, Std={ratio_std:.3f}")
+                    
+                    # Chart 2: Colored by abs(pred_test - pred_train)
+                    with col2:
+                        fig2 = px.scatter(
+                            df,
+                            x=train_col,
+                            y="auc_test",
+                            color="pred_diff",
+                            color_continuous_scale="Viridis",
+                            title="AUC Train vs Test (Color: |pred_test - pred_train|)",
+                            labels={
+                                train_col: train_col.replace('_', ' ').title(),
+                                "auc_test": "AUC Test",
+                                "pred_diff": "Pred Diff",
+                            },
+                        )
+                        fig2.add_shape(
+                            type="line",
+                            x0=min_val, y0=min_val,
+                            x1=max_val, y1=max_val,
+                            line=dict(color="gray", dash="dash"),
+                        )
+                        fig2.update_layout(height=400)
+                        st.plotly_chart(fig2, use_container_width=True)
+                        
+                        # Stats for diff
+                        diff_mean = df["pred_diff"].mean()
+                        diff_std = df["pred_diff"].std()
+                        st.caption(f"Pred Diff: Mean={diff_mean:.4f}, Std={diff_std:.4f}")
+                else:
+                    st.info("No complete data for prediction stability charts.")
+            else:
+                missing = [c for c in required_cols if c not in metrics_df.columns]
+                if train_col is None:
+                    missing.append("auc_train or auc_val")
+                st.info(f"Prediction stability charts require: {', '.join(missing)}")
     
     # ─────────────────────────────────────────────────────────────────────────
     # Tab 5: Run Details
