@@ -279,6 +279,22 @@ def _resolve_selected_features_from_config(config: Dict[str, Any], available_col
     return selected
 
 
+def _resolve_categorical_features(config: Dict[str, Any], selected_features: List[str]) -> List[str]:
+    """Resolve categorical feature names from config, filtered to selected features."""
+    fs = config.get("feature_selection") or {}
+    categorical = list(fs.get("categorical") or [])
+    if not categorical:
+        return []
+    # Only include categorical features that are in the selected feature set
+    resolved = [c for c in categorical if c in selected_features]
+    missing = [c for c in categorical if c not in selected_features]
+    if missing:
+        logging.warning("Some categorical features not in selected features: %s", missing)
+    if resolved:
+        logging.info("Using %d categorical features: %s", len(resolved), resolved[:5] if len(resolved) > 5 else resolved)
+    return resolved
+
+
 def _align_selected_across_splits(selected: List[str], dfs: List[pd.DataFrame]) -> List[str]:
     """Keep only columns present in all provided dataframes."""
     if not selected:
@@ -295,14 +311,29 @@ def _primary_metric_for_objective(objective_name: str, config_metrics: Optional[
         return config_metrics[0]
     if objective_name == 'binary':
         return 'auc'
+    if objective_name == 'huber':
+        return 'medianae'
     return 'rmse'
 
 
-def _evaluate_metric(name: str, y_true: np.ndarray, y_pred: np.ndarray, alpha: Optional[float] = None) -> float:
+def _evaluate_metric(name: str, y_true: np.ndarray, y_pred: np.ndarray, threshold: Optional[float] = None) -> float:
+    """Evaluate a metric. threshold is used for quantile alpha or num_errors threshold."""
     if name == 'rmse':
         return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
     if name == 'mae' or name == 'l1':
         return float(np.mean(np.abs(y_true - y_pred)))
+    if name == 'median_abs_error':
+        return float(np.median(np.abs(y_true - y_pred)))
+    if name == 'quantile':
+        alpha = threshold if threshold is not None else 0.2
+        residuals = y_true - y_pred
+        return float(np.mean(np.where(residuals >= 0, alpha * residuals, (alpha - 1) * residuals)))
+    if name == 'num_errors':
+        thresh = threshold if threshold is not None else 0.25
+        return float(np.sum(np.abs(y_true - y_pred) > thresh))
+    if name == 'num_errors_pct':
+        thresh = threshold if threshold is not None else 0.25
+        return float(np.mean(np.abs(y_true - y_pred) > thresh) * 100)
     if name == 'corr':
         try:
             if np.std(y_true) == 0.0 or np.std(y_pred) == 0.0:
@@ -432,10 +463,11 @@ def _map_lgbm_params_to_catboost(params: Dict[str, Any]) -> Dict[str, Any]:
     return mapped
 
 
-def _get_catboost_params(objective_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+def _get_catboost_params(objective_name: str, params: Dict[str, Any], objective_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Build CatBoost parameters with stability-focused defaults."""
     # Map any LightGBM params to CatBoost equivalents
     mapped_params = _map_lgbm_params_to_catboost(params)
+    objective_params = objective_params or {}
     
     catboost_params = {
         'random_seed': 42,
@@ -447,6 +479,19 @@ def _get_catboost_params(objective_name: str, params: Dict[str, Any]) -> Dict[st
     if objective_name == 'binary':
         catboost_params['loss_function'] = 'Logloss'
         catboost_params['eval_metric'] = 'AUC'
+    elif objective_name == 'huber':
+        delta = objective_params.get('delta', 1.5)
+        catboost_params['loss_function'] = f'Huber:delta={delta}'
+        # Primary eval metric for early stopping
+        catboost_params['eval_metric'] = 'MedianAbsoluteError'
+        # Additional custom metrics to track during training
+        catboost_params['custom_metric'] = [
+            'MedianAbsoluteError',
+            'Quantile:alpha=0.2',
+            'NumErrors:greater_than=0.25',
+            'MAE',
+            'RMSE',
+        ]
     else:
         catboost_params['loss_function'] = 'RMSE'
         catboost_params['eval_metric'] = 'RMSE'
@@ -497,6 +542,7 @@ def _run_catboost_cv(
     iterations: int,
     od_wait: int,
     objective_name: str,
+    cat_features: Optional[List[str]] = None,
 ) -> Tuple[float, float, int]:
     """Run CatBoost CV manually across time-series folds."""
     fold_scores = []
@@ -508,8 +554,8 @@ def _run_catboost_cv(
         X_val_fold = X.iloc[val_idx]
         y_val_fold = y.iloc[val_idx]
         
-        train_pool = Pool(X_train_fold, y_train_fold)
-        val_pool = Pool(X_val_fold, y_val_fold)
+        train_pool = Pool(X_train_fold, y_train_fold, cat_features=cat_features)
+        val_pool = Pool(X_val_fold, y_val_fold, cat_features=cat_features)
         
         # Remove iterations/od_wait from params since we pass them separately
         model_params = {k: v for k, v in params.items() if k not in ('iterations', 'od_wait')}
@@ -530,7 +576,11 @@ def _run_catboost_cv(
         
         if objective_name == 'binary':
             preds = model.predict_proba(X_val_fold)[:, 1]
-            score = roc_auc_score(y_val_fold, preds)
+            preds_clipped = np.clip(preds, 1e-12, 1 - 1e-12)
+            score = log_loss(y_val_fold, preds_clipped, labels=[0, 1])  # Logloss for binary
+        elif objective_name == 'huber':
+            preds = model.predict(X_val_fold)
+            score = np.median(np.abs(y_val_fold.values - preds))  # MedianAE for huber
         else:
             preds = model.predict(X_val_fold)
             score = np.sqrt(np.mean((y_val_fold.values - preds) ** 2))
@@ -555,6 +605,7 @@ def _tune_grid_search(config: Dict[str, Any], data_dir: Path, search_space: Dict
     if sel:
         X_full_train = X_full_train[sel]
         logging.info("Applied feature_selection: using %d features", len(X_full_train.columns))
+    cat_features = _resolve_categorical_features(config, list(X_full_train.columns)) or None
 
     base_params = config['model'].get('params', {})
     cv_cfg = _get_cv_config(config['model'])
@@ -572,8 +623,8 @@ def _tune_grid_search(config: Dict[str, Any], data_dir: Path, search_space: Dict
     keys = list(search_space.keys())
     values_lists = [search_space[k] for k in keys]
     best_params = base_params.copy()
-    # For AUC higher is better; for RMSE lower is better
-    best_score = float('-inf') if objective_name == 'binary' else float('inf')
+    # For all objectives, lower is better (logloss, MedianAE, RMSE)
+    best_score = float('inf')
     best_iter_for_best = None
     primary = _primary_metric_for_objective(objective_name, config['model'].get('eval_metrics'))
 
@@ -585,15 +636,17 @@ def _tune_grid_search(config: Dict[str, Any], data_dir: Path, search_space: Dict
         for k, v in zip(keys, combo):
             trial_params[k] = v
 
-        catboost_params = _get_catboost_params(objective_name, trial_params)
+        catboost_params = _get_catboost_params(objective_name, trial_params, obj.get('params'))
 
-        logging.info(f"[grid] Trial {trial_idx} params: {json.dumps(trial_params, sort_keys=True)}")
+        # Log params without iterations/od_wait (those come from cv_cfg, not trial_params)
+        log_params = {k: v for k, v in trial_params.items() if k not in ('iterations', 'od_wait')}
+        logging.info(f"[grid] Trial {trial_idx} params: {json.dumps(log_params, sort_keys=True)}")
         logging.info(f"[grid] Trial {trial_idx}: starting CV with iterations={iterations}, od_wait={od_wait}, folds={cv_cfg['n_folds']}")
         
         try:
             mean_score, std_score, avg_best_iter = _run_catboost_cv(
                 X_full_train, y_full_train, folds, catboost_params,
-                iterations, od_wait, objective_name,
+                iterations, od_wait, objective_name, cat_features=cat_features,
             )
         except Exception as e:
             logging.warning(f"[grid] Trial {trial_idx} failed: {e}")
@@ -628,9 +681,8 @@ def _tune_grid_search(config: Dict[str, Any], data_dir: Path, search_space: Dict
         if rejected:
             continue
 
-        # Check if this is best (higher AUC is better, lower RMSE is better)
-        is_better = (objective_name == 'binary' and mean_score > best_score) or \
-                    (objective_name != 'binary' and mean_score < best_score)
+        # Check if this is best (lower is better for all: logloss, MedianAE, RMSE)
+        is_better = mean_score < best_score
         if is_better:
             best_score = mean_score
             best_params = trial_params.copy()
@@ -660,6 +712,7 @@ def _tune_bayesian(config: Dict[str, Any], data_dir: Path, search_space: Dict[st
     if sel:
         X_full_train = X_full_train[sel]
         logging.info("Applied feature_selection: using %d features", len(X_full_train.columns))
+    cat_features = _resolve_categorical_features(config, list(X_full_train.columns)) or None
 
     base_params = config['model'].get('params', {})
     cv_cfg = _get_cv_config(config['model'])
@@ -686,14 +739,16 @@ def _tune_bayesian(config: Dict[str, Any], data_dir: Path, search_space: Dict[st
         for k, choices in zip(keys, values_lists):
             trial_params[k] = trial.suggest_categorical(k, choices)
 
-        catboost_params = _get_catboost_params(objective_name, trial_params)
+        catboost_params = _get_catboost_params(objective_name, trial_params, obj.get('params'))
 
-        logging.info(f"[bayes] Trial {trial.number} params: {json.dumps(trial_params, sort_keys=True)}")
+        # Log params without iterations/od_wait (those come from cv_cfg, not trial_params)
+        log_params = {k: v for k, v in trial_params.items() if k not in ('iterations', 'od_wait')}
+        logging.info(f"[bayes] Trial {trial.number} params: {json.dumps(log_params, sort_keys=True)}")
         
         try:
             mean_score, std_score, avg_best_iter = _run_catboost_cv(
                 X_full_train, y_full_train, folds, catboost_params,
-                iterations, od_wait, objective_name,
+                iterations, od_wait, objective_name, cat_features=cat_features,
             )
         except Exception as e:
             logging.warning(f"[bayes] Trial {trial.number} failed: {e}")
@@ -731,7 +786,7 @@ def _tune_bayesian(config: Dict[str, Any], data_dir: Path, search_space: Dict[st
         # For AUC, optuna maximizes; for RMSE, it minimizes
         return mean_score
 
-    direction = 'maximize' if objective_name == 'binary' else 'minimize'
+    direction = 'minimize'  # Lower is better for all: logloss, MedianAE, RMSE
     study = optuna.create_study(direction=direction)
     study.optimize(objective_fn, n_trials=DEFAULT_TRIALS)
     
@@ -755,8 +810,12 @@ def _load_timestamps(data_dir: Path) -> Dict[str, List[str]]:
     return meta.get('split_timestamps', {'train': [], 'val': [], 'test': []})
 
 
-def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, Any]) -> Tuple[Any, Dict[str, float], Path]:
-    """Train CatBoost model and return (model, metrics, run_dir)."""
+def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, Any], use_early_stopping: bool = False) -> Tuple[Any, Dict[str, float], Path]:
+    """Train CatBoost model and return (model, metrics, run_dir).
+    
+    Args:
+        use_early_stopping: If True, use od_wait for early stopping. If False, train for exact iterations.
+    """
     _ensure_logging_initialized()
     logging.info("Starting CatBoost model training...")
 
@@ -778,6 +837,9 @@ def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, A
         X_val = X_val[sel]
         X_test = X_test[sel]
         logging.info("Applied feature_selection to splits: %d -> %d features", prev, len(sel))
+    
+    # Resolve categorical features
+    cat_features = _resolve_categorical_features(config, list(X_train.columns)) or None
 
     # Get training parameters
     iterations = int(best_params.get('iterations', best_params.get('num_boost_round', 
@@ -785,16 +847,16 @@ def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, A
     od_wait = int(best_params.get('od_wait', best_params.get('early_stopping_rounds',
                   config['model'].get('params', {}).get('od_wait', 100))))
 
-    catboost_params = _get_catboost_params(objective_name, best_params)
+    catboost_params = _get_catboost_params(objective_name, best_params, obj.get('params'))
     
     logging.info(
         "Final CatBoost training params (objective=%s, iterations=%d, od_wait=%d): %s",
         objective_name, iterations, od_wait, json.dumps(catboost_params, sort_keys=True),
     )
 
-    # Create pools
-    train_pool = Pool(X_train, y_train)
-    val_pool = Pool(X_val, y_val)
+    # Create pools with categorical features
+    train_pool = Pool(X_train, y_train, cat_features=cat_features)
+    val_pool = Pool(X_val, y_val, cat_features=cat_features)
 
     # Remove iterations/od_wait from params since we pass them separately
     model_params = {k: v for k, v in catboost_params.items() if k not in ('iterations', 'od_wait')}
@@ -805,14 +867,22 @@ def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, A
     else:
         model = CatBoostRegressor(**model_params, iterations=iterations)
 
-    model.fit(
-        train_pool,
-        eval_set=val_pool,
-        early_stopping_rounds=od_wait,
-        verbose=100,  # Log every 100 iterations
-    )
-
-    best_iter = model.get_best_iteration() or iterations
+    if use_early_stopping:
+        model.fit(
+            train_pool,
+            eval_set=val_pool,
+            early_stopping_rounds=od_wait,
+            verbose=100,
+        )
+        best_iter = model.get_best_iteration() or iterations
+    else:
+        model.fit(
+            train_pool,
+            eval_set=val_pool,
+            verbose=100,
+            use_best_model=False,  # Don't shrink to best eval iteration
+        )
+        best_iter = iterations  # Train for exact iterations, no early stopping
     logging.info(
         "Training summary: iterations=%d, best_iteration=%d, features=%d, train_rows=%d, val_rows=%d, test_rows=%d",
         iterations, best_iter, len(X_train.columns), len(X_train), len(X_val), len(X_test),
@@ -837,6 +907,26 @@ def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, A
         metrics['auc_train'] = _evaluate_metric('auc', y_train.values, preds_train)
         metrics['auc_val'] = _evaluate_metric('auc', y_val.values, preds_val)
         metrics['auc_test'] = _evaluate_metric('auc', y_test.values, preds_test)
+    elif objective_name == 'huber':
+        # Huber-specific metrics matching custom_metric in _get_catboost_params
+        metrics['mae_train'] = _evaluate_metric('mae', y_train.values, preds_train)
+        metrics['mae_val'] = _evaluate_metric('mae', y_val.values, preds_val)
+        metrics['mae_test'] = _evaluate_metric('mae', y_test.values, preds_test)
+        metrics['median_abs_error_train'] = _evaluate_metric('median_abs_error', y_train.values, preds_train)
+        metrics['median_abs_error_val'] = _evaluate_metric('median_abs_error', y_val.values, preds_val)
+        metrics['median_abs_error_test'] = _evaluate_metric('median_abs_error', y_test.values, preds_test)
+        metrics['quantile_0.2_train'] = _evaluate_metric('quantile', y_train.values, preds_train, 0.2)
+        metrics['quantile_0.2_val'] = _evaluate_metric('quantile', y_val.values, preds_val, 0.2)
+        metrics['quantile_0.2_test'] = _evaluate_metric('quantile', y_test.values, preds_test, 0.2)
+        metrics['num_errors_pct_train'] = _evaluate_metric('num_errors_pct', y_train.values, preds_train, 0.25)
+        metrics['num_errors_pct_val'] = _evaluate_metric('num_errors_pct', y_val.values, preds_val, 0.25)
+        metrics['num_errors_pct_test'] = _evaluate_metric('num_errors_pct', y_test.values, preds_test, 0.25)
+        metrics['rmse_train'] = _evaluate_metric('rmse', y_train.values, preds_train)
+        metrics['rmse_val'] = _evaluate_metric('rmse', y_val.values, preds_val)
+        metrics['rmse_test'] = _evaluate_metric('rmse', y_test.values, preds_test)
+        metrics['corr_train'] = _evaluate_metric('corr', y_train.values, preds_train)
+        metrics['corr_val'] = _evaluate_metric('corr', y_val.values, preds_val)
+        metrics['corr_test'] = _evaluate_metric('corr', y_test.values, preds_test)
     else:
         metrics['rmse_train'] = _evaluate_metric('rmse', y_train.values, preds_train)
         metrics['rmse_val'] = _evaluate_metric('rmse', y_val.values, preds_val)
@@ -983,7 +1073,9 @@ def main():
         final_params = tuned_best_params if use_best_for_final else config['model'].get('params', {})
 
         # Step 3: Train model
-        _, metrics, run_dir = train_model(config, data_dir, final_params)
+        # Early stopping only when NOT using tuned params (use_best_params_for_final=false)
+        use_early_stopping = not use_best_for_final
+        _, metrics, run_dir = train_model(config, data_dir, final_params, use_early_stopping=use_early_stopping)
         
         # Step 4: Persist outputs
         run_dir = persist_results(config, run_dir, metrics, final_params, data_dir)
