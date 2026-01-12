@@ -2,16 +2,22 @@
 """
 CLI tool to compute SHAP values for trained models.
 
-Supports both LightGBM and CatBoost models, loading features from DuckDB.
+Supports both LightGBM and CatBoost models, loading features from DuckDB or CSV.
 
 Usage:
     python analysis/shap/shap_compute.py --run-name <mlflow_run_name> --start 2025-01-01 --end 2025-12-31
     
-    # Or with explicit paths:
+    # Or with explicit paths (DuckDB):
     python analysis/shap/shap_compute.py \\
         --model-path /path/to/model.cbm \\
         --model-type catboost \\
-        --feature-key backfill_daily \\
+        --start 2025-01-01 --end 2025-12-31
+    
+    # Or with CSV features (for regression models):
+    python analysis/shap/shap_compute.py \\
+        --model-path /path/to/model.cbm \\
+        --model-type catboost \\
+        --features-csv /path/to/merged_features_targets.csv \\
         --start 2025-01-01 --end 2025-12-31
 """
 
@@ -55,17 +61,28 @@ def load_lightgbm_model(model_path: Path):
 
 
 def load_catboost_model(model_path: Path):
-    """Load a CatBoost model from .cbm or .joblib file."""
+    """Load a CatBoost model from .cbm or .joblib file.
+    
+    Automatically detects if it's a classifier or regressor.
+    """
     if model_path.suffix == ".cbm":
-        from catboost import CatBoostClassifier
-        model = CatBoostClassifier()
-        model.load_model(str(model_path))
-        return model
+        # Try loading as classifier first, then regressor
+        try:
+            from catboost import CatBoostClassifier
+            model = CatBoostClassifier()
+            model.load_model(str(model_path))
+            return model
+        except Exception:
+            from catboost import CatBoostRegressor
+            model = CatBoostRegressor()
+            model.load_model(str(model_path))
+            return model
     elif model_path.suffix == ".joblib":
         import joblib
         return joblib.load(model_path)
     else:
         raise ValueError(f"Unknown CatBoost model format: {model_path.suffix}")
+
 
 
 def get_model_features(model, model_type: str) -> List[str]:
@@ -76,6 +93,60 @@ def get_model_features(model, model_type: str) -> List[str]:
         return list(model.feature_names_)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
+
+
+def is_classifier(model) -> bool:
+    """Check if model is a classifier (has predict_proba)."""
+    return hasattr(model, 'predict_proba')
+
+
+def load_features_from_csv(
+    csv_path: Path,
+    start_ts: str,
+    end_ts: str,
+    feature_names: List[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load features from a CSV file.
+    
+    Args:
+        csv_path: Path to CSV file with features
+        start_ts: Start timestamp (ISO format)
+        end_ts: End timestamp (ISO format)
+        feature_names: List of feature columns to load
+    
+    Returns:
+        (features_df, meta_df) where meta_df contains timestamp column
+    """
+    logger.info("Loading features from CSV: %s", csv_path)
+    
+    df = pd.read_csv(csv_path)
+    
+    # Parse timestamp column
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    else:
+        raise ValueError("CSV must have a 'timestamp' column")
+    
+    # Filter by date range
+    start_dt = pd.to_datetime(start_ts, utc=True)
+    end_dt = pd.to_datetime(end_ts, utc=True)
+    df = df[(df['timestamp'] >= start_dt) & (df['timestamp'] <= end_dt)]
+    
+    logger.info("Filtered to %d rows in date range [%s, %s]", len(df), start_ts, end_ts)
+    
+    if len(df) == 0:
+        raise ValueError(f"No data found in date range {start_ts} to {end_ts}")
+    
+    # Check for missing features
+    missing = set(feature_names) - set(df.columns)
+    if missing:
+        raise ValueError(f"Features missing from CSV: {missing}")
+    
+    meta_df = df[['timestamp']].copy()
+    features_df = df[feature_names].copy()
+    
+    return features_df, meta_df
 
 
 def compute_shap_values(
@@ -132,7 +203,10 @@ def compute_shap_values(
     if model_type == "lightgbm":
         predictions = model.predict(features_df)
     else:  # catboost
-        predictions = model.predict_proba(features_df)[:, 1]
+        if is_classifier(model):
+            predictions = model.predict_proba(features_df)[:, 1]
+        else:
+            predictions = model.predict(features_df)
     
     return shap_array, base_values, predictions
 
@@ -150,6 +224,8 @@ def main() -> None:
                         help="Model type (required with --model-path)")
     
     # Feature loading
+    parser.add_argument("--features-csv", type=Path, default=None,
+                        help="Path to CSV file with features (alternative to DuckDB)")
     parser.add_argument("--feature-db", type=Path, default=FEATURE_DB_PATH,
                         help="Path to feature DuckDB database")
     parser.add_argument("--feature-table", type=str, default=None,
@@ -204,16 +280,7 @@ def main() -> None:
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
-    # Determine feature table
-    if args.feature_table:
-        feature_table = args.feature_table
-    elif model_type == "lightgbm":
-        feature_table = "features"
-    else:  # catboost
-        feature_table = "derived_features_inference"
-    
     logger.info("Model: %s (%s)", model_path, model_type)
-    logger.info("Feature table: %s.%s", args.feature_db, feature_table)
     
     # Load model
     if model_type == "lightgbm":
@@ -231,14 +298,36 @@ def main() -> None:
     start_ts = pd.to_datetime(args.start, utc=True).isoformat()
     end_ts = pd.to_datetime(args.end, utc=True).isoformat()
     
-    # Load features
-    features_df, meta_df = load_features_from_duckdb(
-        db_path=args.feature_db,
-        table=feature_table,
-        start_ts=start_ts,
-        end_ts=end_ts,
-        feature_names=feature_names,
-    )
+    # Load features (from CSV or DuckDB)
+    if args.features_csv:
+        if not args.features_csv.exists():
+            raise FileNotFoundError(f"Features CSV not found: {args.features_csv}")
+        logger.info("Loading features from CSV: %s", args.features_csv)
+        features_df, meta_df = load_features_from_csv(
+            csv_path=args.features_csv,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            feature_names=feature_names,
+        )
+        feature_source = str(args.features_csv)
+    else:
+        # Determine feature table
+        if args.feature_table:
+            feature_table = args.feature_table
+        elif model_type == "lightgbm":
+            feature_table = "features"
+        else:  # catboost
+            feature_table = "derived_features_inference"
+        
+        logger.info("Loading features from DuckDB: %s.%s", args.feature_db, feature_table)
+        features_df, meta_df = load_features_from_duckdb(
+            db_path=args.feature_db,
+            table=feature_table,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            feature_names=feature_names,
+        )
+        feature_source = f"{args.feature_db}:{feature_table}"
     
     logger.info("Loaded %d samples with %d features", len(features_df), len(features_df.columns))
     
@@ -277,7 +366,7 @@ def main() -> None:
         run_name=run_name,
         model_type=model_type,
         model_path=str(model_path),
-        feature_table=feature_table,
+        feature_table=feature_source,  # Can be CSV path or DB:table
         start_date=args.start,
         end_date=args.end,
         num_samples=len(features_df),

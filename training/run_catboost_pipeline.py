@@ -174,6 +174,14 @@ def prepare_training_data(config: Dict[str, Any]) -> Path:
         missing = [p for p in expected if not (existing_dir / p).exists()]
         if missing:
             raise FileNotFoundError(f"Existing splits missing required files: {missing}")
+        # Validate that the existing split matches the target variable
+        target_var = config.get('target', {}).get('variable', '')
+        dir_name = existing_dir.name
+        if target_var and target_var not in dir_name:
+            raise ValueError(
+                f"Target variable mismatch: config specifies '{target_var}' but existing_dir is '{dir_name}'. "
+                f"Please ensure the split was prepared for the correct target or create a new split."
+            )
         prepared_dir = existing_dir
     else:
         ts = config.get('_run_ts') or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -316,13 +324,18 @@ def _primary_metric_for_objective(objective_name: str, config_metrics: Optional[
     return 'rmse'
 
 
-def _evaluate_metric(name: str, y_true: np.ndarray, y_pred: np.ndarray, threshold: Optional[float] = None) -> float:
-    """Evaluate a metric. threshold is used for quantile alpha or num_errors threshold."""
+def _evaluate_metric(name: str, y_true: np.ndarray, y_pred: np.ndarray, threshold: Optional[float] = None, weights: Optional[np.ndarray] = None) -> float:
+    """Evaluate a metric. 
+    
+    Args:
+        threshold: Used for quantile alpha, num_errors threshold, or huber delta
+        weights: Optional sample weights for weighted metrics (wmae, huber)
+    """
     if name == 'rmse':
         return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
     if name == 'mae' or name == 'l1':
         return float(np.mean(np.abs(y_true - y_pred)))
-    if name == 'median_abs_error':
+    if name in {'medianae', 'median_abs_error'}:
         return float(np.median(np.abs(y_true - y_pred)))
     if name == 'quantile':
         alpha = threshold if threshold is not None else 0.2
@@ -334,22 +347,110 @@ def _evaluate_metric(name: str, y_true: np.ndarray, y_pred: np.ndarray, threshol
     if name == 'num_errors_pct':
         thresh = threshold if threshold is not None else 0.25
         return float(np.mean(np.abs(y_true - y_pred) > thresh) * 100)
-    if name == 'corr':
+    if name in {'corr', 'pearson', 'correlation'}:
         try:
             if np.std(y_true) == 0.0 or np.std(y_pred) == 0.0:
-                return float('nan')
-            return float(np.corrcoef(y_true, y_pred)[0, 1])
+                return float('inf')  # No variance = undefined, return worst score
+            return -float(np.corrcoef(y_true, y_pred)[0, 1])  # Negated: higher corr = lower (better) score
         except Exception:
-            return float('nan')
+            return float('inf')
+    if name in {'spearman', 'spearman_corr', 'rank_corr'}:
+        try:
+            from scipy.stats import spearmanr
+            corr, _ = spearmanr(y_true, y_pred)
+            if np.isnan(corr):
+                return float('inf')
+            return -float(corr)  # Negated: higher corr = lower (better) score
+        except Exception:
+            return float('inf')
     if name in {'binary_logloss', 'logloss', 'cross_entropy'}:
         p = np.clip(y_pred, 1e-12, 1 - 1e-12)
         return float(log_loss(y_true, p, labels=[0, 1]))
     if name in {'auc', 'roc_auc'}:
         try:
-            return float(roc_auc_score(y_true, y_pred))
+            return -float(roc_auc_score(y_true, y_pred))  # Negated: higher AUC = lower (better) score
         except Exception:
-            return float('nan')
+            return float('inf')
+    # Weighted MAE (CatBoost formula): sum(w * |a - t|) / sum(w)
+    if name in {'wmae', 'weighted_mae'}:
+        if weights is None:
+            weights = np.ones_like(y_true)
+        abs_errors = np.abs(y_true - y_pred)
+        return float(np.sum(weights * abs_errors) / np.sum(weights))
+    # Huber loss (CatBoost formula): weighted piecewise loss
+    # l(t,a) = 0.5*(t-a)^2 if |t-a| <= delta, else delta*|t-a| - 0.5*delta^2
+    if name.startswith('huber'):
+        delta = float(threshold) if threshold is not None else float(name.split(':')[1]) if ':' in name else 1.0
+        if weights is None:
+            weights = np.ones_like(y_true)
+        residuals = np.abs(y_true - y_pred)
+        loss = np.where(
+            residuals <= delta,
+            0.5 * residuals ** 2,
+            delta * residuals - 0.5 * delta ** 2
+        )
+        return float(np.sum(weights * loss) / np.sum(weights))
+    # Top K% mean: mean(y_true) for samples with highest K% predictions
+    # Returns negated since higher is better but CV minimizes
+    if name.startswith('top_k_mean'):
+        k_pct = float(threshold) if threshold is not None else float(name.split(':')[1]) if ':' in name else 10.0
+        k_pct = min(max(k_pct, 1), 100)  # Clamp to [1, 100]
+        n_samples = max(1, int(len(y_true) * k_pct / 100))
+        top_indices = np.argsort(y_pred)[-n_samples:]  # Highest predictions
+        return -float(np.mean(y_true[top_indices]))  # Negated: higher mean = lower (better) score
+    # Bottom K% mean: mean(y_true) for samples with lowest K% predictions
+    # Returns positive since lower predictions should have lower y_true
+    if name.startswith('bottom_k_mean'):
+        k_pct = float(threshold) if threshold is not None else float(name.split(':')[1]) if ':' in name else 10.0
+        k_pct = min(max(k_pct, 1), 100)
+        n_samples = max(1, int(len(y_true) * k_pct / 100))
+        bottom_indices = np.argsort(y_pred)[:n_samples]  # Lowest predictions
+        return float(np.mean(y_true[bottom_indices]))  # Lower mean = lower (better) score
     return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def compute_sample_weights(y: np.ndarray, config: Dict[str, Any]) -> Optional[np.ndarray]:
+    """Compute sample weights based on config rules.
+    
+    Config format:
+        "sample_weights": {
+            "strategy": "target_value_mapping",
+            "rules": {
+                "2": 5,      # y == 2 gets weight 5
+                "-1": 2,     # y == -1 gets weight 2
+                "default": 1 # all other values get weight 1
+            }
+        }
+    
+    Returns None if no sample_weights config is present.
+    """
+    weight_cfg = config.get('model', {}).get('sample_weights')
+    if not weight_cfg:
+        return None
+    
+    strategy = weight_cfg.get('strategy', 'target_value_mapping')
+    if strategy != 'target_value_mapping':
+        logging.warning(f"Unknown sample_weights strategy: {strategy}, ignoring weights")
+        return None
+    
+    rules = weight_cfg.get('rules', {})
+    if not rules:
+        return None
+    
+    default_weight = float(rules.get('default', 1.0))
+    weights = np.full(len(y), default_weight, dtype=np.float64)
+    
+    for val_str, weight in rules.items():
+        if val_str == 'default':
+            continue
+        val = float(val_str)
+        mask = np.isclose(y, val, atol=1e-6)
+        weights[mask] = float(weight)
+    
+    logging.info(f"Applied sample weights: {dict((str(k), v) for k, v in rules.items())}, "
+                 f"weight stats: min={weights.min():.2f}, max={weights.max():.2f}, mean={weights.mean():.2f}")
+    
+    return weights
 
 
 def _make_run_dir(config: Dict[str, Any], prepared_dir: Path) -> Path:
@@ -488,9 +589,7 @@ def _get_catboost_params(objective_name: str, params: Dict[str, Any], objective_
         catboost_params['custom_metric'] = [
             'MedianAbsoluteError',
             'Quantile:alpha=0.2',
-            'NumErrors:greater_than=0.25',
-            'MAE',
-            'RMSE',
+            'NumErrors:greater_than=0.25'
         ]
     else:
         catboost_params['loss_function'] = 'RMSE'
@@ -542,9 +641,15 @@ def _run_catboost_cv(
     iterations: int,
     od_wait: int,
     objective_name: str,
+    eval_metric_name: str,
     cat_features: Optional[List[str]] = None,
+    sample_weights: Optional[np.ndarray] = None,
 ) -> Tuple[float, float, int]:
-    """Run CatBoost CV manually across time-series folds."""
+    """Run CatBoost CV manually across time-series folds.
+    
+    Args:
+        eval_metric_name: Name of metric to use for scoring (e.g., 'logloss', 'medianae', 'rmse', 'correlation')
+    """
     fold_scores = []
     fold_best_iters = []
     
@@ -554,7 +659,10 @@ def _run_catboost_cv(
         X_val_fold = X.iloc[val_idx]
         y_val_fold = y.iloc[val_idx]
         
-        train_pool = Pool(X_train_fold, y_train_fold, cat_features=cat_features)
+        # Get fold weights if provided
+        fold_weights = sample_weights[train_idx] if sample_weights is not None else None
+        
+        train_pool = Pool(X_train_fold, y_train_fold, weight=fold_weights, cat_features=cat_features)
         val_pool = Pool(X_val_fold, y_val_fold, cat_features=cat_features)
         
         # Remove iterations/od_wait from params since we pass them separately
@@ -574,16 +682,17 @@ def _run_catboost_cv(
         
         best_iter = model.get_best_iteration() or iterations
         
+        # Get predictions based on objective type
         if objective_name == 'binary':
             preds = model.predict_proba(X_val_fold)[:, 1]
-            preds_clipped = np.clip(preds, 1e-12, 1 - 1e-12)
-            score = log_loss(y_val_fold, preds_clipped, labels=[0, 1])  # Logloss for binary
-        elif objective_name == 'huber':
-            preds = model.predict(X_val_fold)
-            score = np.median(np.abs(y_val_fold.values - preds))  # MedianAE for huber
         else:
             preds = model.predict(X_val_fold)
-            score = np.sqrt(np.mean((y_val_fold.values - preds) ** 2))
+        
+        # Get validation weights for weighted metrics
+        val_weights = sample_weights[val_idx] if sample_weights is not None else None
+        
+        # Use configurable metric for scoring (with weights for weighted metrics)
+        score = _evaluate_metric(eval_metric_name, y_val_fold.values, preds, weights=val_weights)
         
         fold_scores.append(score)
         fold_best_iters.append(best_iter)
@@ -606,6 +715,9 @@ def _tune_grid_search(config: Dict[str, Any], data_dir: Path, search_space: Dict
         X_full_train = X_full_train[sel]
         logging.info("Applied feature_selection: using %d features", len(X_full_train.columns))
     cat_features = _resolve_categorical_features(config, list(X_full_train.columns)) or None
+
+    # Compute sample weights if configured
+    sample_weights = compute_sample_weights(y_full_train.values, config)
 
     base_params = config['model'].get('params', {})
     cv_cfg = _get_cv_config(config['model'])
@@ -646,7 +758,8 @@ def _tune_grid_search(config: Dict[str, Any], data_dir: Path, search_space: Dict
         try:
             mean_score, std_score, avg_best_iter = _run_catboost_cv(
                 X_full_train, y_full_train, folds, catboost_params,
-                iterations, od_wait, objective_name, cat_features=cat_features,
+                iterations, od_wait, objective_name, eval_metric_name=primary,
+                cat_features=cat_features, sample_weights=sample_weights,
             )
         except Exception as e:
             logging.warning(f"[grid] Trial {trial_idx} failed: {e}")
@@ -714,6 +827,9 @@ def _tune_bayesian(config: Dict[str, Any], data_dir: Path, search_space: Dict[st
         logging.info("Applied feature_selection: using %d features", len(X_full_train.columns))
     cat_features = _resolve_categorical_features(config, list(X_full_train.columns)) or None
 
+    # Compute sample weights if configured
+    sample_weights = compute_sample_weights(y_full_train.values, config)
+
     base_params = config['model'].get('params', {})
     cv_cfg = _get_cv_config(config['model'])
     iterations = cv_cfg['iterations']
@@ -748,7 +864,8 @@ def _tune_bayesian(config: Dict[str, Any], data_dir: Path, search_space: Dict[st
         try:
             mean_score, std_score, avg_best_iter = _run_catboost_cv(
                 X_full_train, y_full_train, folds, catboost_params,
-                iterations, od_wait, objective_name, cat_features=cat_features,
+                iterations, od_wait, objective_name, eval_metric_name=primary,
+                cat_features=cat_features, sample_weights=sample_weights,
             )
         except Exception as e:
             logging.warning(f"[bayes] Trial {trial.number} failed: {e}")
@@ -854,8 +971,11 @@ def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, A
         objective_name, iterations, od_wait, json.dumps(catboost_params, sort_keys=True),
     )
 
-    # Create pools with categorical features
-    train_pool = Pool(X_train, y_train, cat_features=cat_features)
+    # Compute sample weights if configured
+    train_weights = compute_sample_weights(y_train.values, config)
+
+    # Create pools with categorical features and weights
+    train_pool = Pool(X_train, y_train, weight=train_weights, cat_features=cat_features)
     val_pool = Pool(X_val, y_val, cat_features=cat_features)
 
     # Remove iterations/od_wait from params since we pass them separately
@@ -909,24 +1029,14 @@ def train_model(config: Dict[str, Any], data_dir: Path, best_params: Dict[str, A
         metrics['auc_test'] = _evaluate_metric('auc', y_test.values, preds_test)
     elif objective_name == 'huber':
         # Huber-specific metrics matching custom_metric in _get_catboost_params
-        metrics['mae_train'] = _evaluate_metric('mae', y_train.values, preds_train)
-        metrics['mae_val'] = _evaluate_metric('mae', y_val.values, preds_val)
-        metrics['mae_test'] = _evaluate_metric('mae', y_test.values, preds_test)
         metrics['median_abs_error_train'] = _evaluate_metric('median_abs_error', y_train.values, preds_train)
         metrics['median_abs_error_val'] = _evaluate_metric('median_abs_error', y_val.values, preds_val)
         metrics['median_abs_error_test'] = _evaluate_metric('median_abs_error', y_test.values, preds_test)
-        metrics['quantile_0.2_train'] = _evaluate_metric('quantile', y_train.values, preds_train, 0.2)
-        metrics['quantile_0.2_val'] = _evaluate_metric('quantile', y_val.values, preds_val, 0.2)
-        metrics['quantile_0.2_test'] = _evaluate_metric('quantile', y_test.values, preds_test, 0.2)
-        metrics['num_errors_pct_train'] = _evaluate_metric('num_errors_pct', y_train.values, preds_train, 0.25)
-        metrics['num_errors_pct_val'] = _evaluate_metric('num_errors_pct', y_val.values, preds_val, 0.25)
-        metrics['num_errors_pct_test'] = _evaluate_metric('num_errors_pct', y_test.values, preds_test, 0.25)
-        metrics['rmse_train'] = _evaluate_metric('rmse', y_train.values, preds_train)
-        metrics['rmse_val'] = _evaluate_metric('rmse', y_val.values, preds_val)
-        metrics['rmse_test'] = _evaluate_metric('rmse', y_test.values, preds_test)
-        metrics['corr_train'] = _evaluate_metric('corr', y_train.values, preds_train)
-        metrics['corr_val'] = _evaluate_metric('corr', y_val.values, preds_val)
-        metrics['corr_test'] = _evaluate_metric('corr', y_test.values, preds_test)
+        # Add custom eval metrics from config
+        for custom_metric in config.get('model', {}).get('eval_metrics', []):
+            metrics[f'{custom_metric}_train'] = _evaluate_metric(custom_metric, y_train.values, preds_train)
+            metrics[f'{custom_metric}_val'] = _evaluate_metric(custom_metric, y_val.values, preds_val)
+            metrics[f'{custom_metric}_test'] = _evaluate_metric(custom_metric, y_test.values, preds_test)
     else:
         metrics['rmse_train'] = _evaluate_metric('rmse', y_train.values, preds_train)
         metrics['rmse_val'] = _evaluate_metric('rmse', y_val.values, preds_val)

@@ -329,6 +329,36 @@ def main():
                     markers=True,
                 )
                 st.plotly_chart(fig, use_container_width=True)
+
+            # Directional SHAP (Signed) Chart for Segments
+            if segment_by_target and selected_features:
+                st.markdown("### Directional SHAP Contribution (y=1 vs y=0)")
+                # Filter for y=0/y=1 segments only
+                directional_df = monthly_df[monthly_df["segment"].isin(["y_true=0", "y_true=1"])]
+                
+                # Allow user to pick one feature to focus on for clarity
+                target_feature = st.selectbox(
+                    "Select Feature for Directional Detail", 
+                    options=selected_features,
+                    index=0,
+                    key="directional_feat_select"
+                )
+                
+                feat_dir_df = directional_df[directional_df["feature"] == target_feature]
+                
+                if not feat_dir_df.empty:
+                    fig_dir = px.line(
+                        feat_dir_df,
+                        x="month",
+                        y="mean_shap",
+                        color="segment",
+                        title=f"Directional SHAP: {target_feature} (y=1 vs y=0)",
+                        labels={"mean_shap": "Mean SHAP (Signed)", "month": "Month"},
+                        markers=True,
+                        color_discrete_map={"y_true=1": "green", "y_true=0": "red"}
+                    )
+                    fig_dir.add_hline(y=0, line_dash="dash", line_color="gray")
+                    st.plotly_chart(fig_dir, use_container_width=True)
         
         # Monthly heatmap
         st.subheader("Monthly Importance Heatmap")
