@@ -69,7 +69,7 @@ def _apply_feature_filters(
         pattern_matches: set[str] = set()
         for pattern in include_patterns:
             pattern_matches.update(fnmatch.filter(df.columns, pattern))
-        filtered_cols.extend([c for c in pattern_matches if c not in filtered_cols or c == target_col])
+        filtered_cols.extend([c for c in pattern_matches if c not in filtered_cols])
 
     # Always drop auxiliary target columns (y_*) except for the chosen target
     filtered_cols = [
@@ -97,6 +97,8 @@ def _clean_dataframe(
     *,
     warmup_rows: int = 0,
 ) -> Tuple[pd.DataFrame, List[str], int, List[str]]:
+    # Create a copy to avoid modifying the input DataFrame
+    df = df.copy()
     df, selected_columns = _apply_feature_filters(df, target_col, include_features, include_patterns, exclude_features)
     cols_to_numeric = [c for c in df.columns if c not in ('timestamp', target_col)]
     for c in cols_to_numeric:
@@ -308,8 +310,9 @@ def _load_feature_store(features_path: Path, targets_path: Path, target_col: str
     if "timestamp" not in features.columns or "timestamp" not in targets.columns:
         raise ValueError("Both features and targets files must include a 'timestamp' column")
 
-    features["timestamp"] = pd.to_datetime(features["timestamp"], utc=True)
-    targets["timestamp"] = pd.to_datetime(targets["timestamp"], utc=True)
+    # Normalize timestamps: parse as UTC then convert to tz-naive for consistent comparisons
+    features["timestamp"] = pd.to_datetime(features["timestamp"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    targets["timestamp"] = pd.to_datetime(targets["timestamp"], utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
 
     merged = features.merge(targets, on="timestamp", how="inner", suffixes=("", "_target"))
     if target_col not in merged.columns:
@@ -535,6 +538,9 @@ def generate_walk_forward_splits(
     # Ensure sorted by timestamp
     df = df.sort_values("timestamp").reset_index(drop=True)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+    # Normalize to tz-naive for consistent comparisons
+    if df["timestamp"].dt.tz is not None:
+        df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
 
     # Apply date range filter if specified
     if date_start is not None:
@@ -578,8 +584,14 @@ def generate_walk_forward_splits(
         if mode == "expanding":
             train_start = data_start
         else:  # rolling
-            train_start = val_start - relativedelta(months=rolling_train_months)
-            train_start = max(train_start, data_start)
+            train_start_unclamped = val_start - relativedelta(months=rolling_train_months)
+            train_start = max(train_start_unclamped, data_start)
+            if train_start != train_start_unclamped:
+                import warnings
+                warnings.warn(
+                    f"Rolling train_start clamped to data_start: requested {train_start_unclamped.date()} -> {train_start.date()}",
+                    UserWarning
+                )
 
         train_end = val_start
 
@@ -673,10 +685,11 @@ def generate_walk_forward_splits(
             return {"min": None, "max": None}
 
         # Write prep_metadata.json (same format as existing)
+        fold_total_rows = len(train_df) + len(val_df) + len(test_df)
         meta = PrepMetadata(
             input_path="walk_forward_split",
             num_rows_before=num_rows_before,
-            num_rows_after=len(train_df) + len(val_df) + len(test_df),
+            num_rows_after=num_rows_after,  # After NA drop, before slicing
             num_features_before=num_cols_before,
             num_features_after=num_cols_after,
             target_column=target_col,
@@ -684,6 +697,7 @@ def generate_walk_forward_splits(
             split_params={
                 "fold_index": str(i),
                 "total_folds": str(len(folds)),
+                "fold_total_rows": str(fold_total_rows),
                 "mode": mode,
                 "test_days": str(test_days),
                 "val_days": str(val_days),
@@ -716,8 +730,30 @@ def generate_walk_forward_splits(
 
         fold_dirs.append(fold_dir)
 
-    # Write top-level walk_forward_config.json
-    config_summary = {
+    # Collect fold stats for summary
+    fold_stats = []
+    for i, (fold, fold_dir) in enumerate(zip(folds, fold_dirs), start=1):
+        with open(fold_dir / "prep_metadata.json") as f:
+            meta = json.load(f)
+        train_rows = len(meta["split_timestamps"]["train"])
+        val_rows = len(meta["split_timestamps"]["val"])
+        test_rows = len(meta["split_timestamps"]["test"])
+        # Expected rows based on days (hourly data assumption)
+        expected_train_days = (fold["train_end"] - fold["train_start"]).days
+        expected_val_days = (fold["val_end"] - fold["val_start"]).days
+        expected_test_days = (fold["test_end"] - fold["test_start"]).days
+        fold_stats.append({
+            "name": f"fold_{i:02d}",
+            "train_rows": train_rows,
+            "val_rows": val_rows,
+            "test_rows": test_rows,
+            "expected_train_days": expected_train_days,
+            "expected_val_days": expected_val_days,
+            "expected_test_days": expected_test_days,
+        })
+
+    # Write walk_forward_params.json (input parameters only)
+    params = {
         "mode": mode,
         "test_days": test_days,
         "val_days": val_days,
@@ -726,7 +762,16 @@ def generate_walk_forward_splits(
         "rolling_train_months": rolling_train_months,
         "allow_partial_test": allow_partial_test,
         "min_test_days": min_test_days,
+        "extend_last_test": extend_last_test,
+        "date_start": date_start,
+        "date_end": date_end,
         "warmup_rows": warmup_rows,
+    }
+    with open(output_dir / "walk_forward_params.json", "w") as f:
+        json.dump(params, f, indent=2)
+
+    # Write walk_forward_config.json (planned boundaries per fold)
+    config = {
         "data_start": str(data_start),
         "data_end": str(data_end),
         "num_folds": len(folds),
@@ -744,7 +789,20 @@ def generate_walk_forward_splits(
         ],
     }
     with open(output_dir / "walk_forward_config.json", "w") as f:
-        json.dump(config_summary, f, indent=2)
+        json.dump(config, f, indent=2)
+
+    # Write walk_forward_summary.json (actual results)
+    summary = {
+        "data_start": str(data_start),
+        "data_end": str(data_end),
+        "num_rows_before_cleaning": num_rows_before,
+        "num_rows_after_cleaning": num_rows_after,
+        "dropped_na_rows": dropped_na_rows,
+        "num_folds": len(folds),
+        "folds": fold_stats,
+    }
+    with open(output_dir / "walk_forward_summary.json", "w") as f:
+        json.dump(summary, f, indent=2)
 
     return fold_dirs
 
@@ -817,6 +875,10 @@ def walk_forward_main() -> None:
     parser.add_argument('--date-end', type=str, default=None,
                         help='Optional end date filter (inclusive), e.g., 2025-12-31')
     # Feature filtering
+    parser.add_argument('--include-features', type=str, nargs='+', default=None,
+                        help='Feature column names to include (space-separated)')
+    parser.add_argument('--exclude-features', type=str, nargs='+', default=None,
+                        help='Feature column names to exclude (space-separated)')
     parser.add_argument('--warmup-rows', type=int, default=0,
                         help='Drop the first N rows before processing')
     args = parser.parse_args()
@@ -839,6 +901,8 @@ def walk_forward_main() -> None:
         extend_last_test=args.extend_last_test,
         date_start=args.date_start,
         date_end=args.date_end,
+        include_features=args.include_features,
+        exclude_features=args.exclude_features,
         warmup_rows=args.warmup_rows,
     )
 
