@@ -174,14 +174,18 @@ def prepare_training_data(config: Dict[str, Any]) -> Path:
         missing = [p for p in expected if not (existing_dir / p).exists()]
         if missing:
             raise FileNotFoundError(f"Existing splits missing required files: {missing}")
-        # Validate that the existing split matches the target variable
+        # Validate that the existing split matches the target variable using prep_metadata.json
         target_var = config.get('target', {}).get('variable', '')
-        dir_name = existing_dir.name
-        if target_var and target_var not in dir_name:
-            raise ValueError(
-                f"Target variable mismatch: config specifies '{target_var}' but existing_dir is '{dir_name}'. "
-                f"Please ensure the split was prepared for the correct target or create a new split."
-            )
+        metadata_path = existing_dir / 'prep_metadata.json'
+        if target_var and metadata_path.exists():
+            with open(metadata_path) as f:
+                prep_meta = json.load(f)
+            meta_target = prep_meta.get('target_column', '')
+            if meta_target and meta_target != target_var:
+                raise ValueError(
+                    f"Target variable mismatch: config specifies '{target_var}' but prep_metadata.json has '{meta_target}'. "
+                    f"Please ensure the split was prepared for the correct target or create a new split."
+                )
         prepared_dir = existing_dir
     else:
         ts = config.get('_run_ts') or datetime.now().strftime("%Y%m%d_%H%M%S")
