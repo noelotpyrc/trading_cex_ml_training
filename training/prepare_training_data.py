@@ -456,6 +456,299 @@ def prepare_splits_from_feature_store(
     return final_out_dir
 
 
+def generate_walk_forward_splits(
+    df: pd.DataFrame,
+    output_dir: Path,
+    target_col: str,
+    # Window sizes
+    test_days: int = 90,
+    val_days: int = 30,
+    min_train_months: int = 12,
+    step_days: int = 30,
+    # Mode
+    mode: str = "expanding",  # or "rolling"
+    rolling_train_months: Optional[int] = None,
+    # Boundary handling
+    allow_partial_test: bool = False,
+    min_test_days: int = 30,
+    extend_last_test: bool = True,
+    # Date range filter
+    date_start: Optional[str] = None,
+    date_end: Optional[str] = None,
+    # Feature filtering
+    include_features: Optional[Sequence[str]] = None,
+    include_patterns: Optional[Sequence[str]] = None,
+    exclude_features: Optional[Sequence[str]] = None,
+    warmup_rows: int = 0,
+) -> List[Path]:
+    """Generate walk-forward folds with rolling or expanding training windows.
+
+    Creates fold directories (fold_01, fold_02, ...) each containing train/val/test
+    splits in the same format as prepare_splits(), compatible with downstream pipelines.
+
+    Args:
+        df: DataFrame with 'timestamp' column and features + target.
+        output_dir: Base directory for output. Folds written to output_dir/fold_NN/.
+        target_col: Name of the target column.
+        test_days: Number of days in each test window.
+        val_days: Number of days in each validation window.
+        min_train_months: Minimum training data required (in months) for first fold.
+        step_days: How many days to slide forward between folds.
+        mode: 'expanding' (train grows over time) or 'rolling' (fixed train window).
+        rolling_train_months: Train window size in months when mode='rolling'. Required if mode='rolling'.
+        allow_partial_test: If True, allow last fold to have partial test data.
+        min_test_days: Minimum test days required when allow_partial_test=True.
+        include_features: Feature column names to include.
+        include_patterns: Glob patterns to match feature columns.
+        exclude_features: Feature column names or patterns to exclude.
+        warmup_rows: Number of initial rows to drop after sorting.
+        extend_last_test: If True, extend last fold's test to include all remaining data.
+        date_start: Optional start date filter (inclusive) for input data.
+        date_end: Optional end date filter (inclusive) for input data.
+
+    Returns:
+        List of fold directory paths created.
+    """
+    from dateutil.relativedelta import relativedelta
+
+    if "timestamp" not in df.columns:
+        raise ValueError("DataFrame must have a 'timestamp' column")
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in DataFrame")
+    if mode == "rolling" and rolling_train_months is None:
+        raise ValueError("rolling_train_months is required when mode='rolling'")
+
+    # Warn if step_days differs from test_days (causes overlapping or gaps in test periods)
+    if step_days != test_days:
+        import warnings
+        if step_days < test_days:
+            warnings.warn(
+                f"step_days ({step_days}) < test_days ({test_days}): test periods will overlap by {test_days - step_days} days",
+                UserWarning
+            )
+        else:
+            warnings.warn(
+                f"step_days ({step_days}) > test_days ({test_days}): there will be {step_days - test_days} day gaps between test periods",
+                UserWarning
+            )
+
+    # Ensure sorted by timestamp
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+    # Apply date range filter if specified
+    if date_start is not None:
+        df = df[df["timestamp"] >= pd.to_datetime(date_start)]
+    if date_end is not None:
+        df = df[df["timestamp"] <= pd.to_datetime(date_end)]
+    if len(df) == 0:
+        raise ValueError(f"No data remaining after date filter: date_start={date_start}, date_end={date_end}")
+    df = df.reset_index(drop=True)
+
+    data_start = df["timestamp"].min()
+    data_end = df["timestamp"].max()
+
+    # Compute fold boundaries
+    folds: List[Dict[str, pd.Timestamp]] = []
+
+    # First fold: train ends after min_train_months from data_start
+    first_train_end = data_start + relativedelta(months=min_train_months)
+
+    current_test_start = first_train_end + pd.Timedelta(days=val_days)
+
+    while True:
+        test_end_target = current_test_start + pd.Timedelta(days=test_days)
+
+        # Check if test window has enough data
+        actual_test_end = min(test_end_target, data_end + pd.Timedelta(days=1))
+        test_days_available = (actual_test_end - current_test_start).days
+
+        if test_days_available < min_test_days:
+            # Not enough test data, stop generating folds
+            break
+
+        if test_days_available < test_days and not allow_partial_test:
+            # Partial test not allowed, stop
+            break
+
+        # Compute train and val boundaries
+        val_end = current_test_start
+        val_start = val_end - pd.Timedelta(days=val_days)
+
+        if mode == "expanding":
+            train_start = data_start
+        else:  # rolling
+            train_start = val_start - relativedelta(months=rolling_train_months)
+            train_start = max(train_start, data_start)
+
+        train_end = val_start
+
+        # Validate train has enough data
+        train_months_actual = (train_end.year - train_start.year) * 12 + (train_end.month - train_start.month)
+        if train_months_actual < min_train_months:
+            # Not enough training data, skip to next potential fold
+            current_test_start += pd.Timedelta(days=step_days)
+            continue
+
+        folds.append({
+            "train_start": train_start,
+            "train_end": train_end,
+            "val_start": val_start,
+            "val_end": val_end,
+            "test_start": current_test_start,
+            "test_end": actual_test_end,
+        })
+
+        # Slide forward
+        current_test_start += pd.Timedelta(days=step_days)
+
+    if not folds:
+        raise ValueError(
+            f"Could not generate any folds. Data range: {data_start} to {data_end}, "
+            f"min_train_months={min_train_months}, test_days={test_days}, val_days={val_days}"
+        )
+
+    # Extend last fold's test to include all remaining data
+    if extend_last_test and folds:
+        last_fold = folds[-1]
+        leftover_end = data_end + pd.Timedelta(days=1)  # Make end exclusive boundary past last timestamp
+        if leftover_end > last_fold["test_end"]:
+            leftover_days = (leftover_end - last_fold["test_end"]).days
+            import warnings
+            warnings.warn(
+                f"Extending last fold test by {leftover_days} days to include remaining data "
+                f"(test_end: {last_fold['test_end']} -> {leftover_end})",
+                UserWarning
+            )
+            last_fold["test_end"] = leftover_end
+
+    # Clean DataFrame once (feature filtering, NA handling)
+    num_rows_before, num_cols_before = df.shape
+    df_cleaned, dropped_constants, dropped_na_rows, selected_columns = _clean_dataframe(
+        df,
+        target_col=target_col,
+        include_features=include_features,
+        include_patterns=include_patterns,
+        exclude_features=exclude_features,
+        warmup_rows=warmup_rows,
+    )
+    num_rows_after, num_cols_after = df_cleaned.shape
+
+    # Create output directory
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_dirs: List[Path] = []
+
+    for i, fold in enumerate(folds, start=1):
+        fold_name = f"fold_{i:02d}"
+        fold_dir = output_dir / fold_name
+        fold_dir.mkdir(parents=True, exist_ok=True)
+
+        # Slice data for each split
+        ts = df_cleaned["timestamp"]
+        train_mask = (ts >= fold["train_start"]) & (ts < fold["train_end"])
+        val_mask = (ts >= fold["val_start"]) & (ts < fold["val_end"])
+        test_mask = (ts >= fold["test_start"]) & (ts < fold["test_end"])
+
+        train_df = df_cleaned[train_mask].copy()
+        val_df = df_cleaned[val_mask].copy()
+        test_df = df_cleaned[test_mask].copy()
+
+        # Write outputs using existing helper
+        _write_outputs(fold_dir, target_col, train_df, val_df, test_df)
+
+        # Helper functions for metadata
+        def _ts_list(part_df: pd.DataFrame) -> List[str]:
+            if "timestamp" in part_df.columns and len(part_df) > 0:
+                return part_df["timestamp"].astype(str).tolist()
+            return []
+
+        def _ts_range(part_df: pd.DataFrame) -> Dict[str, Optional[str]]:
+            if "timestamp" in part_df.columns and len(part_df) > 0:
+                return {
+                    "min": str(part_df["timestamp"].min()),
+                    "max": str(part_df["timestamp"].max()),
+                }
+            return {"min": None, "max": None}
+
+        # Write prep_metadata.json (same format as existing)
+        meta = PrepMetadata(
+            input_path="walk_forward_split",
+            num_rows_before=num_rows_before,
+            num_rows_after=len(train_df) + len(val_df) + len(test_df),
+            num_features_before=num_cols_before,
+            num_features_after=num_cols_after,
+            target_column=target_col,
+            split_strategy=f"walk_forward_{mode}",
+            split_params={
+                "fold_index": str(i),
+                "total_folds": str(len(folds)),
+                "mode": mode,
+                "test_days": str(test_days),
+                "val_days": str(val_days),
+                "min_train_months": str(min_train_months),
+                "step_days": str(step_days),
+                "train_start": str(fold["train_start"]),
+                "train_end": str(fold["train_end"]),
+                "val_start": str(fold["val_start"]),
+                "val_end": str(fold["val_end"]),
+                "test_start": str(fold["test_start"]),
+                "test_end": str(fold["test_end"]),
+            },
+            dropped_constant_columns=dropped_constants,
+            dropped_na_rows=dropped_na_rows,
+            split_timestamps={
+                "train": _ts_list(train_df),
+                "val": _ts_list(val_df),
+                "test": _ts_list(test_df),
+            },
+            split_timestamp_ranges={
+                "train": _ts_range(train_df),
+                "val": _ts_range(val_df),
+                "test": _ts_range(test_df),
+            },
+            selected_feature_columns=[c for c in selected_columns if c not in dropped_constants],
+            excluded_feature_columns=list(exclude_features or []),
+        )
+        with open(fold_dir / "prep_metadata.json", "w") as f:
+            json.dump(asdict(meta), f, indent=2, default=str)
+
+        fold_dirs.append(fold_dir)
+
+    # Write top-level walk_forward_config.json
+    config_summary = {
+        "mode": mode,
+        "test_days": test_days,
+        "val_days": val_days,
+        "min_train_months": min_train_months,
+        "step_days": step_days,
+        "rolling_train_months": rolling_train_months,
+        "allow_partial_test": allow_partial_test,
+        "min_test_days": min_test_days,
+        "warmup_rows": warmup_rows,
+        "data_start": str(data_start),
+        "data_end": str(data_end),
+        "num_folds": len(folds),
+        "folds": [
+            {
+                "name": f"fold_{i:02d}",
+                "train_start": str(fold["train_start"]),
+                "train_end": str(fold["train_end"]),
+                "val_start": str(fold["val_start"]),
+                "val_end": str(fold["val_end"]),
+                "test_start": str(fold["test_start"]),
+                "test_end": str(fold["test_end"]),
+            }
+            for i, fold in enumerate(folds, start=1)
+        ],
+    }
+    with open(output_dir / "walk_forward_config.json", "w") as f:
+        json.dump(config_summary, f, indent=2)
+
+    return fold_dirs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Prepare ML training data from merged features-targets')
     parser.add_argument('--input', type=Path, required=True, help='Path to merged_features_targets.csv')
@@ -491,5 +784,73 @@ def main() -> None:
     )
 
 
+def walk_forward_main() -> None:
+    """CLI entry point for generating walk-forward splits."""
+    parser = argparse.ArgumentParser(
+        description='Generate walk-forward validation splits from merged features-targets'
+    )
+    parser.add_argument('--input', type=Path, required=True, help='Path to merged_features_targets.csv')
+    parser.add_argument('--output-dir', type=Path, required=True, help='Base output directory for fold subdirectories')
+    parser.add_argument('--target', type=str, required=True, help='Target column to predict')
+    # Window sizes
+    parser.add_argument('--test-days', type=int, default=90, help='Number of days in each test window')
+    parser.add_argument('--val-days', type=int, default=30, help='Number of days in each validation window')
+    parser.add_argument('--min-train-months', type=int, default=12, help='Minimum training data (months) for first fold')
+    parser.add_argument('--step-days', type=int, default=30, help='Days to slide forward between folds')
+    # Mode
+    parser.add_argument('--mode', type=str, default='expanding', choices=['expanding', 'rolling'],
+                        help='Window mode: expanding (train grows) or rolling (fixed train size)')
+    parser.add_argument('--rolling-train-months', type=int, default=None,
+                        help='Train window size in months when mode=rolling (required for rolling mode)')
+    # Boundary handling
+    parser.add_argument('--allow-partial-test', action='store_true',
+                        help='Allow last fold to have partial test data')
+    parser.add_argument('--min-test-days', type=int, default=30,
+                        help='Minimum test days when partial test is allowed')
+    parser.add_argument('--extend-last-test', action='store_true', default=True,
+                        help='Extend last fold test to include remaining data (default: True)')
+    parser.add_argument('--no-extend-last-test', dest='extend_last_test', action='store_false',
+                        help='Do not extend last fold test')
+    # Date range filter
+    parser.add_argument('--date-start', type=str, default=None,
+                        help='Optional start date filter (inclusive), e.g., 2022-01-01')
+    parser.add_argument('--date-end', type=str, default=None,
+                        help='Optional end date filter (inclusive), e.g., 2025-12-31')
+    # Feature filtering
+    parser.add_argument('--warmup-rows', type=int, default=0,
+                        help='Drop the first N rows before processing')
+    args = parser.parse_args()
+
+    # Load input data
+    df = _load_merged(args.input)
+
+    fold_dirs = generate_walk_forward_splits(
+        df=df,
+        output_dir=args.output_dir,
+        target_col=args.target,
+        test_days=args.test_days,
+        val_days=args.val_days,
+        min_train_months=args.min_train_months,
+        step_days=args.step_days,
+        mode=args.mode,
+        rolling_train_months=args.rolling_train_months,
+        allow_partial_test=args.allow_partial_test,
+        min_test_days=args.min_test_days,
+        extend_last_test=args.extend_last_test,
+        date_start=args.date_start,
+        date_end=args.date_end,
+        warmup_rows=args.warmup_rows,
+    )
+
+    print(f"Generated {len(fold_dirs)} walk-forward folds:")
+    for fold_dir in fold_dirs:
+        meta = json.load(open(fold_dir / 'prep_metadata.json', 'r'))
+        train_range = meta['split_timestamp_ranges']['train']
+        test_range = meta['split_timestamp_ranges']['test']
+        print(f"  {fold_dir.name}: train {train_range['min'][:10]} to {train_range['max'][:10]}, "
+              f"test {test_range['min'][:10]} to {test_range['max'][:10]}")
+
+
 if __name__ == '__main__':
     main()
+
