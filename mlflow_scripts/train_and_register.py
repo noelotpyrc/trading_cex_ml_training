@@ -169,6 +169,7 @@ def main() -> None:
     ap.add_argument("--log-level", default="INFO")
     ap.add_argument("--no-register", action="store_true", help="If set, only train; skip MLflow run logging and model registry")
     ap.add_argument("--log-run-only", action="store_true", help="Log run to MLflow tracking (params/metrics/artifacts) but do not register a model")
+    ap.add_argument("--extra-params", type=str, default=None, help="JSON string of extra params to log to MLflow (e.g., '{\"sweep_mode\": \"include\"}')") 
     args = ap.parse_args()
 
     config = _read_config(args.config)
@@ -216,6 +217,8 @@ def main() -> None:
                 cmd.append("--copy-model")
             if args.sanitize_paths:
                 cmd.append("--sanitize-paths")
+            if args.extra_params:
+                cmd.extend(["--extra-params", args.extra_params])
             cmd.append("--no-model-register")
             subprocess.run(cmd, check=True)
             print("Logged run only (no model registry) via registrar")

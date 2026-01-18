@@ -44,6 +44,7 @@ def main() -> None:
     parser.add_argument("--artifact-mode", default="all", choices=["all", "subset"], help="What to log as artifacts from run_dir")
     parser.add_argument("--sanitize-paths", action="store_true", help="If set, log artifacts from a sanitized path symlink (spaces/commas replaced)")
     parser.add_argument("--no-model-register", action="store_true", help="Log run only; skip creating a Registered Model version")
+    parser.add_argument("--extra-params", type=str, default=None, help="JSON string of extra params to log to MLflow")
     args = parser.parse_args()
 
     run_dir: Path = args.run_dir.resolve()
@@ -202,6 +203,16 @@ def main() -> None:
     mcfg = (cfg.get("model", {}) or {})
     hyperparam_tuning = bool(mcfg.get("hyperparameter_tuning_method")) or (mcfg.get("state_grid") is not None)
     params["hyperparam_tuning"] = int(hyperparam_tuning)
+
+    # Parse and merge extra params if provided
+    if args.extra_params:
+        try:
+            extra = json.loads(args.extra_params)
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    params[k] = v
+        except json.JSONDecodeError:
+            pass  # Ignore invalid JSON
 
     # Import mlflow lazily
     import mlflow
